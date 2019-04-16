@@ -124,20 +124,23 @@ void initSetupInterrupts(void)
 void initCreateTask()
 {
 	xTaskCreate(
-			counter_task,
-			"task1",
+			load_manager,
+			"LoadManager_TASK",
 			configMINIMAL_STACK_SIZE,
 			NULL,
-			Counter_Task_P,
+			LoadManager_Task_P,
 			NULL );
 
 	xTaskCreate(
-			freqRelay_task,
-			"task2",
+			freq_analyser,
+			"freqRelay_task",
 			configMINIMAL_STACK_SIZE,
 			NULL,
-			FreqDisp_Task_P,
+			FreqAnalyser_Task_P,
 			NULL );
+	
+	//UpdateThresholds_P
+	//UpdateScreen_P
 
 }
 /*-------------Features--------------------*/
@@ -259,6 +262,8 @@ void load_manager(void *pvParameters)
 int main()
 {
 	printf("Hello Junjie!\n");
+	initSetupSystem();
+	initSetupInterrupts();
 	initCreateTask();
 	vTaskStartScheduler();
 	while (1)
