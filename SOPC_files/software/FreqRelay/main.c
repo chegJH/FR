@@ -194,7 +194,13 @@ void ps2_isr (void* context, alt_u32 id)
     IOWR(SEVEN_SEG_BASE,0 ,key);
   }
 }
+//TODO, followed keyboard isr, update freq threshold
+//Created this feature in individual function or combine in ps2_isr?
+void updateThreshold()
+{
 
+
+}
 /* Frequency relay ISR
  * Record frequency value and time on interupt
  */
