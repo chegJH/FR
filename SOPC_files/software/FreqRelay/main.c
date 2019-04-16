@@ -20,13 +20,14 @@
 #include "altera_avalon_pio_regs.h"
 #include "altera_up_avalon_video_pixel_buffer_dma.h"
 #include "altera_up_avalon_video_character_buffer_with_dma.h"
-#include "sys/alt_irq.h" //keyboard isr
-#include "altera_up_ps2_keyboard.h"//keyboard isr
+#include "altera_up_ps2_keyboard.h"		//keyboard isr
+#include "alt_types.h"                 	// alt_u32 is a kind of alt_types
+#include "sys/alt_irq.h"              	// to register interrupts
 
 /*Task Priorities:*/
-#define Counter_Task_P      	(tskIDLE_PRIORITY)
-#define FreqDisp_Task_P      	(tskIDLE_PRIORITY)
-#define UpdateLoads_Task_P 		(tskIDLE_PRIORITY+3)
+// #define Counter_Task_P      	(tskIDLE_PRIORITY)
+#define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
+#define LoadManager_Task_P 		(tskIDLE_PRIORITY+4)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+2)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+1)
 /*Functions*/
@@ -47,18 +48,37 @@ void initSetupSystem(void);
 struct FreqInfo
 {
 	/* Frequency value and recording time */
-	double freqVal;
-	TickType_t time;
-};
+	double freq_value;
+	TickType_t record_time;
+}
+preFreq{0,0},
+curFreq{0,0};
 
 /*Enum*/
-enum InitialLoads = 5;
+enum NumLoads = 5;
+enum MaxRecordFreqs = 20;
 typedef enum{ MAINTAIN=0, RUN} SystemMode;
 typedef enum{true,false} bool;
 typedef enum{ON=0,OFF,SHED} LoadState;
 
+/*Threshold*/
+double Threshold_Freq = 50;
+double Threshold_RoC = 5;
+
+/*Global Variables
+ * Use to store the frequency history
+ * Graphic use*/
+SystemMode currentSysMode = SystemMode::RUN;
+FreqInfo Freq_History[MaxRecordFreqs];
+int FreqHyIndex = 0;
+LoadState LoadBank[NumLoads] = {ON,ON,ON,ON,ON};
+
+/*Timer*/
+TimeHandler_t timer_System;
+TimeHandler_t timer_LoadManager;
+
 /*Queues:*/
-static QueueHandle_t Q_ReadFreqInfo;
+static QueueHandle_t Q_FreqInfo;
 static QueueHandle_t Q_KeyboardInput;
 static QueueHandle_t Q_VGAUpdateValues;
 static QueueHandle_t Q_VGAUpdateTime;
@@ -67,10 +87,11 @@ static QueueHandle_t Q_VGAUpdateTime;
 void initSetupSystem()
 {
 	//Start with Five loads, indicate by RED LEDs
-	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, InitialLoads);
+	//TODO:if not boot with maintainence mode
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, NumLoads);
 
 	//Initiate Queues
-	Q_ReadFreqInfo = xQueueCreate(100,sizeof(FreqInfo));
+	Q_FreqInfo = xQueueCreate(100,sizeof(FreqInfo));
 	Q_KeyboardInput = xQueueCreate(100,sizeof(unsigned char));
 	Q_VGAUpdateValues = xQueueCreate(100,sizeof(unsigned char));//Change type
 	Q_VGAUpdateTime = xQueueCreate(100,sizeof(unsigned char));//change type
@@ -80,7 +101,14 @@ void initSetupInterrupts(void)
 	//Frequency Analyser ISR
 	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
 
-	//pushbtn interrupts
+	//pushbtn interrupts for maintainence mode
+	int buttonValue = 0;
+	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+	// enable interrupts for all buttons //TODO:specify wchich button.
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+	// register the ISR
+	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
 
 	//Keyboard interrupts
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
@@ -96,23 +124,50 @@ void initSetupInterrupts(void)
 void initCreateTask()
 {
 	xTaskCreate(
-			counter_task,
-			"task1",
+			load_manager,
+			"LoadManager_TASK",
 			configMINIMAL_STACK_SIZE,
 			NULL,
-			Counter_Task_P,
+			LoadManager_Task_P,
 			NULL );
 
 	xTaskCreate(
-			freqRelay_task,
-			"task2",
+			freq_analyser,
+			"freqRelay_task",
 			configMINIMAL_STACK_SIZE,
 			NULL,
-			FreqDisp_Task_P,
+			FreqAnalyser_Task_P,
 			NULL );
+	
+	//UpdateThresholds_P
+	//UpdateScreen_P
 
 }
 /*-------------Features--------------------*/
+/* PushBtn ISR,
+ * use to go into maintenence mode 
+ */
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+  //Set System mode
+  switch(currentSysMode) {
+	  case SystemMode::RUN : {
+		  currentSysMode=SystemMode::MAINTAIN;
+		  break;
+	  }
+	  case SystemMode::MAINTAIN : {
+		  currentSysMode=SystemMode::RUN;
+		  break;
+	  }
+  }
+}
 /* KeyboardISR,
  * called when keyboard is pressed
  */
@@ -151,8 +206,8 @@ void freq_relay(void *pvParameters)
 	}
 	if (SystemMode == RUN)
 	{
-		xQueueSendToBackFromISR( Q_ReadFreqInfo, &freqData, pdFALSE );
-		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.freqVal, pdFALSE );
+		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
+		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
 	}
 	
 /* Frequency analyser
@@ -163,9 +218,32 @@ void freq_relay(void *pvParameters)
  */
 void freq_analyser(void *pvParameters)
 {
-	//read from queue
+	double RoC = 0;
+
+	/* read from queue
+	 * First check the current reading, if it's lower than threshold, call load ctr
+	 * If the avaliable data is more than 2, calculate RoC
+	 */
+	if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
+	{
+		if(curFreq.record_time == 0){//for first reading
+			preFreq = curFreq;
+		}
+		RoC = abs(curFreq.freq_value - preFreq.freq_value)/abs(curFreq.record_time - preFreq.record_time);
+	}
+	/*Store readings to Freq_History[]*/
+	Freq_History[FreqHyIndex%MaxRecordFreqs] = curFreq;
+	
+	if(curFreq.freq_value > Threshold_Freq || RoC > Threshold_RoC)
+	{
+		//TODO: how to connect with load manager here?
+	}
+
+	
+
 
 	//calculate the RoC
+	//TODO: implement system timer
 
 	//compare two thresholds
 
@@ -178,11 +256,15 @@ void freq_analyser(void *pvParameters)
  */
 void load_manager(void *pvParameters)
 {
+	printf("Load manager currently empty")
 
 }
+
 int main()
 {
 	printf("Hello Junjie!\n");
+	initSetupSystem();
+	initSetupInterrupts();
 	initCreateTask();
 	vTaskStartScheduler();
 	while (1)
