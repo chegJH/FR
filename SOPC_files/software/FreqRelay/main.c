@@ -16,23 +16,25 @@
 #include "../Freertos/semphr.h"
 #include "io.h"
 #include "altera_up_avalon_ps2.h"
-#include "altera_up_ps2_keyboard.h"
 #include <unistd.h>
 #include "altera_avalon_pio_regs.h"
 #include "altera_up_avalon_video_pixel_buffer_dma.h"
 #include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "sys/alt_irq.h" //keyboard isr
+#include "altera_up_ps2_keyboard.h"//keyboard isr
 
-//Task Priorities:
+/*Task Priorities:*/
 #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqDisp_Task_P      	(tskIDLE_PRIORITY)
 #define UpdateLoads_Task_P 		(tskIDLE_PRIORITY+3)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+2)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+1)
-//Functions
+/*Functions*/
 //...
 void initCreateTask(void);
-static void counter_task(void *pvParameters);
-static void freqRelay_task(void *pvParameters);
+void initSetupInterrupts(void);
+void initSetupSystem(void);
+
 
 // Definition of Task Stacks
 #define   TASK_STACKSIZE       				2048
@@ -41,43 +43,56 @@ static void freqRelay_task(void *pvParameters);
 #define CHECKFREQ_GETFREQ_PRIORITY      	13
 #define CHECKFREQ_UPDATELED_PRIORITY   		12
 
-void updateLCD_TASK(){
-	// the pointer to the lcd
-	FILE *lcd;
-	// open the character LCD
-	lcd = fopen(CHARACTER_LCD_NAME, "w");
-	// if the lcd is open successfully
-	if(lcd != NULL)
-	{
-		// print the value of the buttons in the character lcd
-		#define ESC 27
-		#define CLEAR_LCD_STRING "[2J"
-//		fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
-//		fprintf(lcd, "Net Freq: %d\n", freq_relay());
-	}
-}
-//counting numbers
-static void counter_task(void *pvParameters)
+/*DataType*/
+struct FreqInfo
 {
-	int count = 0;
-	count++;
-	IOWR(SEVEN_SEG_BASE, 0, count);
-//	vTaskDelay(500);
-}
-//show current freq on lcd
-static void freqRelay_task(void *pvParameters)
-{
-	unsigned int temp = IORD(FREQUENCY_ANALYSER_BASE, 0);
-	FILE* lcd;
-	lcd = fopen(CHARACTER_LCD_NAME,"w");
-	if (lcd != NULL)
-	{
-		fprintf(lcd, "%c%s", ESC, CLEAR_LCD_STRING);
-		fprintf(lcd, "BUTTON VALUE: %d\n", &temp);
-	}
-	printf("freq:%d\n",temp);
-}
+	/* Frequency value and recording time */
+	double freqVal;
+	TickType_t time;
+};
 
+/*Enum*/
+enum InitialLoads = 5;
+typedef enum{ MAINTAIN=0, RUN} SystemMode;
+typedef enum{true,false} bool;
+typedef enum{ON=0,OFF,SHED} LoadState;
+
+/*Queues:*/
+static QueueHandle_t Q_ReadFreqInfo;
+static QueueHandle_t Q_KeyboardInput;
+static QueueHandle_t Q_VGAUpdateValues;
+static QueueHandle_t Q_VGAUpdateTime;
+
+/*--------------------Inits--------------------*/
+void initSetupSystem()
+{
+	//Start with Five loads, indicate by RED LEDs
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, InitialLoads);
+
+	//Initiate Queues
+	Q_ReadFreqInfo = xQueueCreate(100,sizeof(FreqInfo));
+	Q_KeyboardInput = xQueueCreate(100,sizeof(unsigned char));
+	Q_VGAUpdateValues = xQueueCreate(100,sizeof(unsigned char));//Change type
+	Q_VGAUpdateTime = xQueueCreate(100,sizeof(unsigned char));//change type
+}
+void initSetupInterrupts(void)
+{
+	//Frequency Analyser ISR
+	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
+
+	//pushbtn interrupts
+
+	//Keyboard interrupts
+	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
+
+	if(ps2_device == NULL){
+    	printf("can't find PS/2 device\n");
+    	return 1;
+	}
+	alt_up_ps2_clear_fifo (ps2_device) ;
+
+	alt_irq_register(PS2_IRQ, ps2_device, ps2_isr);
+}
 void initCreateTask()
 {
 	xTaskCreate(
@@ -97,9 +112,77 @@ void initCreateTask()
 			NULL );
 
 }
+/*-------------Features--------------------*/
+/* KeyboardISR,
+ * called when keyboard is pressed
+ */
+void ps2_isr (void* context, alt_u32 id)
+{
+  char ascii;
+  int status = 0;
+  unsigned char key = 0;
+  KB_CODE_TYPE decode_mode;
+  status = decode_scancode (context, &decode_mode , &key , &ascii) ;
+  if ( status == 0 ) //success
+  {
+    // print out the result
+    switch ( decode_mode )
+    {
+      case KB_ASCII_MAKE_CODE :
+	  	xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);
+        printf ( "ASCII   : %x\n", key ) ;
+        break ;
+      default :
+        printf ( "DEFAULT   : %x\n", key ) ;
+        break ;
+    }
+    IOWR(SEVEN_SEG_BASE,0 ,key);
+  }
+}
+
+/* Frequency relay ISR
+ * Record frequency value and time on interupt
+ */
+void freq_relay(void *pvParameters)
+{
+	FreqInfo freqData = {
+		xTaskGetTickCountFromISR(),
+		(16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0));
+	}
+	if (SystemMode == RUN)
+	{
+		xQueueSendToBackFromISR( Q_ReadFreqInfo, &freqData, pdFALSE );
+		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.freqVal, pdFALSE );
+	}
+	
+/* Frequency analyser
+ * The core function of Frequency relay
+ * Read from frequency queue, and calculate the rate of changes
+ * Check wether the frequency is lower than frequency_threshold
+ * OR the Rate of Change if above RoC threshold.
+ */
+void freq_analyser(void *pvParameters)
+{
+	//read from queue
+
+	//calculate the RoC
+
+	//compare two thresholds
+
+	//call Load operations
+}
+
+/* Load manager
+ * Control the load operation
+ * ON,OFF,SHED
+ */
+void load_manager(void *pvParameters)
+{
+
+}
 int main()
 {
-	printf("Hello from Nios II!\n");
+	printf("Hello Junjie!\n");
 	initCreateTask();
 	vTaskStartScheduler();
 	while (1)
