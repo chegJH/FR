@@ -1,19 +1,20 @@
 /*
  * main.c
  *
- *  Created on: Apr 15, 2019
- *      Author: Junjie He
+ *  Created on: 17/04/2019
+ *      Author: jhe654
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "system.h"
 #include "altera_avalon_pio_regs.h"
-#include "../FreeRTOS/FreeRTOS.h"
-#include "../FreeRTOS/task.h"
-#include "../FreeRTOS/timers.h"
-#include "../FreeRTOS/queue.h"
-#include "../Freertos/semphr.h"
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/timers.h"
+#include "FreeRTOS/queue.h"
+#include "Freertos/semphr.h"
 #include "io.h"
 #include "altera_up_avalon_ps2.h"
 #include <unistd.h>
@@ -23,7 +24,6 @@
 #include "altera_up_ps2_keyboard.h"		//keyboard isr
 #include "alt_types.h"                 	// alt_u32 is a kind of alt_types
 #include "sys/alt_irq.h"              	// to register interrupts
-
 /*Task Priorities:*/
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
@@ -45,29 +45,33 @@ void initSetupSystem(void);
 #define CHECKFREQ_GETFREQ_PRIORITY      	13
 #define CHECKFREQ_UPDATELED_PRIORITY   		12
 
+/*Enum and Constants*/
+const unsigned int MaxRecordNum = 5;
+typedef enum{ MAINTAIN=0, RUN} SystemMode;
+//typedef enum{true,false} bool;
+typedef enum{UNSTABLE,STABLE} SystemCondition;
+const unsigned int NumLoads=5;
+unsigned int redMask = 0x1F;
+unsigned int redL1Mask = 0x10;
+unsigned int redL2Mask = 0x8;
+unsigned int redL3Mask = 0x4;
+unsigned int redL4Mask = 0x2;
+
 /*DataType*/
-struct FreqInfo
-{
+//typedef struct SysCond{
+//	SystemMode mode,
+//	TickType_t time;
+//}SysCond;
+typedef struct FreqInfo{
 	/* Frequency value and recording time */
 	double freq_value;
 	TickType_t record_time;
-}
-preFreq{0,0},
-curFreq{0,0};
+}FreqInfo;
+FreqInfo preFreq,curFreq;
+FreqInfo historyFreq[5];
 
-/*Enum and Constants*/
-enum NumLoads = 5;
-enum MaxRecordFreqs = 20;
-typedef enum{ MAINTAIN=0, RUN} SystemMode;
-typedef enum{true,false} bool;
-typedef enum{OFF=0,ON,SHED} LoadState;
-typedef enum{UNSTABLE,STABLE} SystemCondition;
-const unsigned int redMask = 0x1F;
-const unsigned int redL1Mask = 0x10;
-const unsigned int redL2Mask = 0x8;
-const unsigned int redL3Mask = 0x4;
-const unsigned int redL4Mask = 0x2;
-const unsigned int redL5Mask = 0x1;
+
+unsigned int redL5Mask = 0x1;
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -76,31 +80,249 @@ double Threshold_RoC = 5;
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
-SystemMode currentSysMode = SystemMode::RUN;
-FreqInfo Freq_History[MaxRecordFreqs];
-int FreqHyIndex = 0;
-LoadState LoadBank[NumLoads] = {ON,ON,ON,ON,ON};
 SystemCondition currentSysStability = STABLE;
-unsigned int LEDBank = redMask;
+SystemMode currentSysMode = RUN;
+int FreqHyIndex = 0;
+enum LoadStatus{
+	OFF=0,
+	ON,
+	SHED,
+} LoadBank[] = {ON,ON,ON,ON,ON};
+unsigned int uiLEDBank = 0;
+unsigned int uiManageTime = 0;
+//bool stability = true, preStability = true;
+SystemCondition preStability=STABLE;
 
 /*Timer*/
-TimeHandler_t timer_System;
-TimeHandler_t timer_LoadManager;
+//TimeHandler_t timer_System; // use vTaskTickCount
+TimerHandle_t timer_LoadManager;
 
 /*Queues:*/
-static QueueHandle_t Q_FreqInfo;
+static QueueHandle_t Q_FreqInfo; //for record and analysis
 static QueueHandle_t Q_KeyboardInput;
 static QueueHandle_t Q_LoadOperation;
 static QueueHandle_t Q_VGAUpdateValues;
 static QueueHandle_t Q_VGAUpdateTime;
 
+
+/*-------------Features--------------------*/
+/* PushBtn ISR,
+ * use to go into maintenence mode
+ */
+void button_interrupts_function(void* context, alt_u32 id)
+{
+  // need to cast the context first before using it
+  int* temp = (int*) context;
+  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+  // clears the edge capture register
+  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+  //Set System mode
+  switch(currentSysMode) {
+	  case RUN : {
+		  currentSysMode= MAINTAIN;
+		  break;
+	  }
+	  case MAINTAIN : {
+		  currentSysMode= RUN;
+		  break;
+	  }
+  }
+}
+/* KeyboardISR,
+ * called when keyboard is pressed
+ */
+void ps2_isr (void* context, alt_u32 id)
+{
+	printf("ps2_isr\n");
+	char ascii;
+	int status = 0;
+	unsigned char key = 0;
+	KB_CODE_TYPE decode_mode;
+	status = decode_scancode (context, &decode_mode , &key , &ascii) ;
+	if ( status == 0 ) //success
+	{
+	// print out the result
+	switch ( decode_mode )
+	{
+	  case KB_ASCII_MAKE_CODE :
+		xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);
+		printf ( "ASCII   : %x\n", key ) ;
+		break ;
+	  default :
+		printf ( "DEFAULT   : %x\n", key ) ;
+		break ;
+	}
+	IOWR(SEVEN_SEG_BASE,0 ,key);
+	}
+}
+//TODO, followed keyboard isr, update freq threshold
+//Created this feature in individual function or combine in ps2_isr?
+void updateThreshold()
+{
+
+
+}
+/* Frequency relay ISR
+ * Record frequency value and time on interupt
+ */
+void freq_relay(void *pvParameters)
+{
+	FreqInfo freqData = {
+		xTaskGetTickCountFromISR(),
+		(16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0))
+	};
+	if (currentSysMode == RUN)
+	{
+		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
+		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
+	}
+}
+
+/* Frequency analyser
+ * The core function of Frequency relay
+ * Read from frequency queue, and calculate the rate of changes
+ * Check wether the frequency is lower than frequency_threshold
+ * OR the Rate of Change if above RoC threshold.
+ */
+void freq_analyser(void *pvParameters)
+{
+	printf("freq_analyser\n");
+	double RoC = 0;
+
+	/* read from queue
+	 * First check the current reading, if it's lower than threshold, call load ctr
+	 * If the avaliable data is more than 2, calculate RoC
+	 */
+	while (1)
+	{
+		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
+		{
+			if(curFreq.record_time == 0){//for first reading
+				preFreq = curFreq;
+			}
+			RoC = abs(curFreq.freq_value - preFreq.freq_value)/abs(curFreq.record_time - preFreq.record_time);
+		}
+		/*Store readings to historyFreq[]*/
+		historyFreq[FreqHyIndex%MaxRecordNum] = curFreq;
+
+		if(curFreq.freq_value < Threshold_Freq || RoC > Threshold_RoC)
+		{
+			xQueueSendToBackFromISR(Q_LoadOperation,UNSTABLE, pdFALSE);
+			currentSysStability = UNSTABLE;
+			printf("Sys UNSTABLE");
+		}else{
+			xQueueSendToBackFromISR(Q_LoadOperation,STABLE, pdFALSE);
+			currentSysStability = STABLE;
+			printf("Sys STABLE");
+		}
+	}
+	//calculate the RoC
+	//TODO: implement system timer
+
+}
+
+/* Load manager
+ * Control the load operation,
+ * Read from Q_LoadOperation
+ * ON,OFF,SHED
+ */
+void load_manager(void *pvParameters)
+{
+	printf("Load manager\n");
+	SystemCondition tempSysCon;
+	while(1)
+	{
+		if (xQueueReceive(Q_LoadOperation,&tempSysCon,portMax_DELAY) == pdTRUE)
+		{
+			switch(tempSysCon){
+				case UNSTABLE: {
+//					stability = false;
+					if (tempSysCon != preStability)
+					{
+						if (uiLEDBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
+						{
+							//TODO:
+
+						}
+						uiManageTime = xTaskGetTickCount();
+					}else{
+						if ( xTaskGetTickCount() - 500 > uiManageTime )
+						{
+							//Drop loads
+						}
+
+					}
+					preStability = false;
+					break;
+				}
+				case STABLE: {
+//					stability = true;
+					if (tempSysCon != preStability)
+					{
+						uiManageTime = xTaskGetTickCount();	//Restart timer
+					}else{
+						if ( xTaskGetTickCount() - 500 > uiManageTime )
+						{
+							if (uiLEDBank != redMask)
+							{
+								//Add loads
+							}
+						}
+
+					}
+					preStability = true;
+					break;
+				}
+			}
+		}
+	}
+	printf("Load manager Error");
+}
+/* UpdateLED
+ * Read the switch value
+ * Turn on the LED if system is stable
+ */
+void update_LED(void *pvParameters)
+{
+	printf("update LED\n");
+	unsigned int uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+	while(currentSysStability)
+	{
+		//read switch value
+		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+		//For Most 5 right
+		uiLEDBank = uiLEDBank & uiSwitchValue;
+		// write the value of the switches to the red LEDs
+		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLEDBank);
+	}
+		printf("update_LED,system unstable");
+}
+
+int main()
+{
+	printf("Hello Junjie!\n");
+	initSetupSystem();
+	initSetupInterrupts();
+	initCreateTask();
+	vTaskStartScheduler();
+	while (1)
+	{
+
+	}
+
+	return 0;
+}
+
 /*--------------------Inits--------------------*/
 void initSetupSystem()
-{	
+{
 	//Start with Five loads, indicate by RED LEDs
 	//TODO:if not boot with maintainence mode
-	if(currentSysMode != SystemMode::MAINTAIN)
-		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, LEDBank);
+	uiLEDBank = redMask;
+	if(currentSysMode != MAINTAIN)
+		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLEDBank);
 
 	//Initiate Queues
 	Q_FreqInfo = xQueueCreate(100,sizeof(FreqInfo));
@@ -128,7 +350,7 @@ void initSetupInterrupts(void)
 
 	if(ps2_device == NULL){
     	printf("can't find PS/2 device\n");
-    	return 1;
+//    	return 1;
 	}
 	alt_up_ps2_clear_fifo (ps2_device) ;
 
@@ -159,184 +381,10 @@ void initCreateTask()
 			NULL,
 			UpdateLED_Task_P,
 			NULL );
-	
+
 	//UpdateThresholds_P
 	//UpdateScreen_P
 
 }
-/*-------------Features--------------------*/
-/* PushBtn ISR,
- * use to go into maintenence mode 
- */
-void button_interrupts_function(void* context, alt_u32 id)
-{
-  // need to cast the context first before using it
-  int* temp = (int*) context;
-  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-
-  // clears the edge capture register
-  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-
-  //Set System mode
-  switch(currentSysMode) {
-	  case SystemMode::RUN : {
-		  currentSysMode=SystemMode::MAINTAIN;
-		  break;
-	  }
-	  case SystemMode::MAINTAIN : {
-		  currentSysMode=SystemMode::RUN;
-		  break;
-	  }
-  }
-}
-/* KeyboardISR,
- * called when keyboard is pressed
- */
-void ps2_isr (void* context, alt_u32 id)
-{
-  char ascii;
-  int status = 0;
-  unsigned char key = 0;
-  KB_CODE_TYPE decode_mode;
-  status = decode_scancode (context, &decode_mode , &key , &ascii) ;
-  if ( status == 0 ) //success
-  {
-    // print out the result
-    switch ( decode_mode )
-    {
-      case KB_ASCII_MAKE_CODE :
-	  	xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);
-        printf ( "ASCII   : %x\n", key ) ;
-        break ;
-      default :
-        printf ( "DEFAULT   : %x\n", key ) ;
-        break ;
-    }
-    IOWR(SEVEN_SEG_BASE,0 ,key);
-  }
-}
-//TODO, followed keyboard isr, update freq threshold
-//Created this feature in individual function or combine in ps2_isr?
-void updateThreshold()
-{
 
 
-}
-/* Frequency relay ISR
- * Record frequency value and time on interupt
- */
-void freq_relay(void *pvParameters)
-{
-	FreqInfo freqData = {
-		xTaskGetTickCountFromISR(),
-		(16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0));
-	}
-	if (SystemMode == RUN)
-	{
-		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
-		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
-	}
-	
-/* Frequency analyser
- * The core function of Frequency relay
- * Read from frequency queue, and calculate the rate of changes
- * Check wether the frequency is lower than frequency_threshold
- * OR the Rate of Change if above RoC threshold.
- */
-void freq_analyser(void *pvParameters)
-{
-	double RoC = 0;
-
-	/* read from queue
-	 * First check the current reading, if it's lower than threshold, call load ctr
-	 * If the avaliable data is more than 2, calculate RoC
-	 */
-	while (1)
-	{
-		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
-		{
-			if(curFreq.record_time == 0){//for first reading
-				preFreq = curFreq;
-			}
-			RoC = abs(curFreq.freq_value - preFreq.freq_value)/abs(curFreq.record_time - preFreq.record_time);
-		}
-		/*Store readings to Freq_History[]*/
-		Freq_History[FreqHyIndex%MaxRecordFreqs] = curFreq;
-		
-		if(curFreq.freq_value > Threshold_Freq || RoC > Threshold_RoC)
-		{
-			xQueueSendToBackFromISR(Q_LoadOperation,SystemCondition::UNSTABLE, pdFALSE);
-			currentSysStability = SystemCondition::UNSTABLE;
-		}else{
-			xQueueSendToBackFromISR(Q_LoadOperation,SystemCondition::STABLE, pdFALSE);
-			currentSysStability = SystemCondition::STABLE;
-		}
-	}	
-	//calculate the RoC
-	//TODO: implement system timer
-	
-}
-
-/* Load manager
- * Control the load operation,
- * Read from Q_LoadOperation
- * ON,OFF,SHED
- */
-void load_manager(void *pvParameters)
-{
-	printf("Load manager");
-	SystemCondition tempSysCon;
-	while(1)
-	{
-		if (xQueueReceive(Q_LoadOperation,&tempSysCon,portMax_DELAY) == pdTrue)
-		{
-			switch(tempSysCon){
-				case UNSTABLE: {
-					printf("Take one load off");
-					//TODO: need a timer here to count 500 ms before bring load backon?
-					break;
-				}
-				case STABLE: {
-					printf("Take one load back");					
-					break;
-				}
-			}
-			
-		}
-	}
-	printf("Load manager Error");
-}
-/* UpdateLED
- * Read the switch value 
- * Turn on the LED if system is stable
- */
-void update_LED(void *pvParameters)
-{
-	while(currentSysStability)
-	{
-		//read switch value
-		uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-		//For Most 5 right
-		LEDBank = LEDBank & uiSwitchValue; 
-
-		// write the value of the switches to the red LEDs
-		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, LEDBank);
-	}
-	printf("update_LED,system unstable, skipped");
-}
-
-
-int main()
-{
-	printf("Hello Junjie!\n");
-	initSetupSystem();
-	initSetupInterrupts();
-	initCreateTask();
-	vTaskStartScheduler();
-	while (1)
-	{
-
-	}
-
-	return 0;
-}
