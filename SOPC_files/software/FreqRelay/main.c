@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
+#include <tgmath.h>
 #include "system.h"
 #include "altera_avalon_pio_regs.h"
 #include "FreeRTOS/FreeRTOS.h"
@@ -24,6 +26,7 @@
 #include "altera_up_ps2_keyboard.h"		//keyboard isr
 #include "alt_types.h"                 	// alt_u32 is a kind of alt_types
 #include "sys/alt_irq.h"              	// to register interrupts
+
 /*Task Priorities:*/
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
@@ -31,11 +34,13 @@
 #define UpdateLED_Task_P 		(tskIDLE_PRIORITY+3)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+2)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+1)
+
 /*Functions*/
-//...
+#define BGMASK				1 // enable this to print debug messages.
 void initCreateTask(void);
 void initSetupInterrupts(void);
 void initSetupSystem(void);
+//int debugPrint(const &string);
 
 
 // Definition of Task Stacks
@@ -48,7 +53,6 @@ void initSetupSystem(void);
 /*Enum and Constants*/
 const unsigned int MaxRecordNum = 5;
 typedef enum{ MAINTAIN=0, RUN} SystemMode;
-//typedef enum{true,false} bool;
 typedef enum{UNSTABLE,STABLE} SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
@@ -56,14 +60,25 @@ unsigned int redL1Mask = 0x10;
 unsigned int redL2Mask = 0x8;
 unsigned int redL3Mask = 0x4;
 unsigned int redL4Mask = 0x2;
+unsigned int redL5Mask = 0x1;
 
 /*DataType*/
+/*SysCond,
+ * Stores system condition and the time it records
+ * mode, the system operating mode at the time it was recorded,
+ * time, the recording time
+ */
 //typedef struct SysCond{
 //	SystemMode mode,
 //	TickType_t time;
 //}SysCond;
+
+/* FreqInfo,
+ * Stores individual frequency and the time it records
+ * freq_value, the frequency value.
+ * record_time, the time frequency value was recorded.
+ */
 typedef struct FreqInfo{
-	/* Frequency value and recording time */
 	double freq_value;
 	TickType_t record_time;
 }FreqInfo;
@@ -71,7 +86,6 @@ FreqInfo preFreq,curFreq;
 FreqInfo historyFreq[5];
 
 
-unsigned int redL5Mask = 0x1;
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -88,6 +102,8 @@ enum LoadStatus{
 	ON,
 	SHED,
 } LoadBank[] = {ON,ON,ON,ON,ON};
+
+/*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLEDBank = 0;
 unsigned int uiManageTime = 0;
 //bool stability = true, preStability = true;
@@ -232,6 +248,7 @@ void load_manager(void *pvParameters)
 {
 	printf("Load manager\n");
 	SystemCondition tempSysCon;
+	unsigned int dropCounter = 0;
 	while(1)
 	{
 		if (xQueueReceive(Q_LoadOperation,&tempSysCon,portMax_DELAY) == pdTRUE)
@@ -243,7 +260,8 @@ void load_manager(void *pvParameters)
 					{
 						if (uiLEDBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 						{
-							//TODO:
+							//TODO:Drop load
+							uiLEDBank -= pow(2,dropCounter);
 
 						}
 						uiManageTime = xTaskGetTickCount();
@@ -280,6 +298,7 @@ void load_manager(void *pvParameters)
 	}
 	printf("Load manager Error");
 }
+
 /* UpdateLED
  * Read the switch value
  * Turn on the LED if system is stable
@@ -288,6 +307,10 @@ void update_LED(void *pvParameters)
 {
 	printf("update LED\n");
 	unsigned int uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+	/*Check LEDBank, indicate load condition with LEDs*/
+	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLEDBank);
+
+	/*If the system is stable, switch can be used to control load on/off correspondingly*/
 	while(currentSysStability)
 	{
 		//read switch value
@@ -387,4 +410,12 @@ void initCreateTask()
 
 }
 
-
+//int debugPrint(const &string str)
+//{
+//	if (BGMSK)
+//	{
+//		printf(str);
+//		printf("\n");
+//	}
+//	return 0;
+//}
