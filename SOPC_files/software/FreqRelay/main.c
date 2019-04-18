@@ -97,17 +97,22 @@ double Threshold_RoC = 5;
 SystemCondition currentSysStability = STABLE;
 SystemMode currentSysMode = RUN;
 int FreqHyIndex = 0;
+
 enum LoadStatus{
 	OFF=0,
 	ON,
 	SHED,
-} LoadBank[] = {ON,ON,ON,ON,ON};
+} LoadBank[] = {ON,ON,ON,ON,ON};//NOTE: currently the uiLEDBank did the job
 
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLEDBank = 0;
 unsigned int uiManageTime = 0;
-//bool stability = true, preStability = true;
-SystemCondition preStability=STABLE;
+
+/*PreSysCon,
+ * stores the previous system condition,
+ * used to when to drop load
+ */
+SystemCondition PreSysCon=STABLE;
 
 /*Timer*/
 //TimeHandler_t timer_System; // use vTaskTickCount
@@ -127,15 +132,16 @@ static QueueHandle_t Q_VGAUpdateTime;
  */
 void button_interrupts_function(void* context, alt_u32 id)
 {
-  // need to cast the context first before using it
-  int* temp = (int*) context;
-  (*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+	printf("button interrupt triggers\n");
+	// need to cast the context first before using it
+	int* temp = (int*) context;
+	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
 
-  // clears the edge capture register
-  IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+//	// clears the edge capture register
+//	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);//NOTE: this is moved to initSetupSys
 
-  //Set System mode
-  switch(currentSysMode) {
+	//Set System mode
+	switch(currentSysMode) {
 	  case RUN : {
 		  currentSysMode= MAINTAIN;
 		  break;
@@ -144,7 +150,7 @@ void button_interrupts_function(void* context, alt_u32 id)
 		  currentSysMode= RUN;
 		  break;
 	  }
-  }
+	}
 }
 /* KeyboardISR,
  * called when keyboard is pressed
@@ -171,6 +177,10 @@ void ps2_isr (void* context, alt_u32 id)
 		break ;
 	}
 	IOWR(SEVEN_SEG_BASE,0 ,key);
+	//set system threshold
+	Threshold_Freq = key;
+	printf("Threshold_Freq sets to:%c",key);//TODO:check if the direct implement works
+
 	}
 }
 //TODO, followed keyboard isr, update freq threshold
@@ -247,37 +257,39 @@ void freq_analyser(void *pvParameters)
 void load_manager(void *pvParameters)
 {
 	printf("Load manager\n");
-	SystemCondition tempSysCon;
+	SystemCondition sysCon;
 	unsigned int dropCounter = 0;
 	while(1)
 	{
-		if (xQueueReceive(Q_LoadOperation,&tempSysCon,portMax_DELAY) == pdTRUE)
+		if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 		{
-			switch(tempSysCon){
+			switch(sysCon){
 				case UNSTABLE: {
 //					stability = false;
-					if (tempSysCon != preStability)
+					if (sysCon != PreSysCon)
 					{
 						if (uiLEDBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 						{
-							//TODO:Drop load
+							/*Drop very first load, the load is not dropped until update_led process it */
 							uiLEDBank -= pow(2,dropCounter);
+							++dropCounter;
 
 						}
 						uiManageTime = xTaskGetTickCount();
 					}else{
 						if ( xTaskGetTickCount() - 500 > uiManageTime )
 						{
-							//Drop loads
+							/*Drop loads after first load is dropped*/
+							uiLEDBank -= pow(2,dropCounter);
+							++dropCounter;
 						}
-
 					}
-					preStability = false;
+					PreSysCon = UNSTABLE;
 					break;
 				}
 				case STABLE: {
 //					stability = true;
-					if (tempSysCon != preStability)
+					if (sysCon != PreSysCon)
 					{
 						uiManageTime = xTaskGetTickCount();	//Restart timer
 					}else{
@@ -286,11 +298,13 @@ void load_manager(void *pvParameters)
 							if (uiLEDBank != redMask)
 							{
 								//Add loads
+								uiLEDBank += pow(2,dropCounter);
+								--dropCounter;
 							}
 						}
 
 					}
-					preStability = true;
+					PreSysCon = STABLE;
 					break;
 				}
 			}
@@ -347,6 +361,9 @@ void initSetupSystem()
 	if(currentSysMode != MAINTAIN)
 		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLEDBank);
 
+	//Init Pushbtn
+	// clears the edge capture register
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 	//Initiate Queues
 	Q_FreqInfo = xQueueCreate(100,sizeof(FreqInfo));
 	Q_KeyboardInput = xQueueCreate(100,sizeof(SystemCondition));
@@ -373,7 +390,6 @@ void initSetupInterrupts(void)
 
 	if(ps2_device == NULL){
     	printf("can't find PS/2 device\n");
-//    	return 1;
 	}
 	alt_up_ps2_clear_fifo (ps2_device) ;
 
