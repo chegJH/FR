@@ -35,12 +35,13 @@
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+2)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+1)
 
+
 /*Functions*/
 #define BGMASK				1 // enable this to print debug messages.
 void initCreateTask(void);
 void initSetupInterrupts(void);
 void initSetupSystem(void);
-//int debugPrint(const &string);
+
 
 
 // Definition of Task Stacks
@@ -52,7 +53,7 @@ void initSetupSystem(void);
 
 /*Enum and Constants*/
 #define MaxRecordNum  5
-typedef enum{ MAINTAIN=0, RUN=1} SystemMode;
+typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
 //typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED=2} SystemCondition;
 /* SystemCondition
  * 0, is unstable 1, stable 2, undefined.
@@ -91,7 +92,7 @@ FreqInfo preFreq,curFreq;
 FreqInfo historyFreq[MaxRecordNum];
 
 /*Semaphore*/
-SemaphoreHandle_t shareSource_LED_sem;
+//SemaphoreHandle_t shareSource_LED_sem;
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -101,14 +102,16 @@ double Threshold_RoC = 5;
  * Use to store the frequency history
  * Graphic use*/
 SystemCondition currentSysStability = 1;//1 for STABLE;
-SystemMode currentSysMode = RUN;
+SystemMode CurSysMode = RUN;
+//SystemMode PreSysMode;
+char keyInputbuffer[10] ;
 
-
-enum LoadStatus{
-	OFF=0,
-	ON,
-	SHED,
-} LoadBank[] = {ON,ON,ON,ON,ON};//NOTE: currently the uiLEDBank did the job
+//
+//enum LoadStatus{
+//	OFF=0,
+//	ON,
+//	SHED,
+//} LoadBank[] = {ON,ON,ON,ON,ON};//NOTE: currently the uiLEDBank did the job
 
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
@@ -133,28 +136,35 @@ static QueueHandle_t Q_VGAUpdateValues;
 static QueueHandle_t Q_VGAUpdateTime;
 
 
-/*-------------Features--------------------*/
+/*-------------Interrupts--------------------*/
 /* PushBtn ISR,
  * use to go into maintenence mode
  */
-void button_interrupts_function(void* context, alt_u32 id)
+void pushbutton_ISR(void* context, alt_u32 id)
 {
-	printf("button interrupt triggers\n");
+//	printf("\n button interrupt triggers\n alt_u32 id = %d\n", id);
 	// need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
 
-	//Set System mode
-	switch(currentSysMode) {
+	switch(CurSysMode) {
 	  case RUN : {
-		  currentSysMode= MAINTAIN;
+		  printf("CurSysMode = Maintain\n");
+		  CurSysMode= MAINTAIN;
 		  break;
 	  }
 	  case MAINTAIN : {
-		  currentSysMode= RUN;
+		  printf("CurSysMode = Run\n");
+		  CurSysMode= RUN;
+		  break;
+	  }
+	  case UNDEFINED : {
+		  printf("CurSysMode have not been defined\n=");
 		  break;
 	  }
 	}
+	// clears the edge capture register
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 }
 /* KeyboardISR,
  * called when keyboard is pressed
@@ -187,13 +197,6 @@ void ps2_isr (void* context, alt_u32 id)
 
 	}
 }
-//TODO, followed keyboard isr, update freq threshold
-//Created this feature in individual function or combine in ps2_isr?
-void updateThreshold()
-{
-
-
-}
 /* Frequency relay ISR
  * Record frequency value and time on interupt
  */
@@ -204,12 +207,30 @@ void freq_relay(void *pvParameters)
 	freqData.record_time = xTaskGetTickCountFromISR();
 //	printf("freeq_value = %f\t time=%d\n",freqData.freq_value, freqData.record_time);
 
-	if (currentSysMode == RUN)
+	if (CurSysMode == RUN)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
+//		PreSysMode = CurSysMode;
 	}
+//	else{
+//		if(PreSysMode != UNDEFINED && CurSysMode != PreSysMode){
+//			printf( "\n freq_relay, in maintain mode\n");
+//		}
+//	}
 	usleep(1000);
+}
+//TODO, followed keyboard isr, update freq threshold
+
+/*-------------TASKs--------------------*/
+/* updateThreshold,
+ * Since ps2_isr is collecting keyboard input into a buffer,
+ * this update function scans the end of entry - a Enter '\n', ideally
+ */
+void updateThreshold()
+{
+
+
 }
 
 /* Frequency analyser
@@ -269,11 +290,11 @@ void freq_analyser(void *pvParameters)
 void load_manager(void *pvParameters)
 {
 	SystemCondition sysCon = 2;
-	while(1)
+	while(CurSysMode == RUN)
 	{
 		if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 		{
-			printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d dropCounter=%d freqThreshold=%d\n",sysCon,uiLoadBank,uiManageTime,dropCounter,Threshold_Freq);
+//			printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d dropCounter=%d freqThreshold=%d\n",sysCon,uiLoadBank,uiManageTime,dropCounter,Threshold_Freq);
 			switch(sysCon){
 				case 0: {
 //					printf("sysCon=UNSTABLE\n");
@@ -342,7 +363,7 @@ void load_manager(void *pvParameters)
 			}
 		}
 	}
-	printf("Load manager Error");
+	printf("Load manager, in maintain mode");
 }
 
 /* UpdateLED
@@ -366,7 +387,7 @@ void update_LED(void *pvParameters)
 //			uiSKPGreenLED = ~(uiSwitchValue & redMask);
 			uiRedLED = uiSwitchValue & uiLoadBank;
 //			uiGreenLED = (uiLoadBank ^ redMask);
-			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask;
+			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
 		if(currentSysStability == 1)
 		{
 			//For Most 5 right
@@ -406,7 +427,7 @@ void initSetupSystem()
 	//Start with Five loads, indicate by RED LEDs
 	//TODO:if not boot with maintainence mode
 	uiLoadBank = redMask;
-	if(currentSysMode != MAINTAIN)
+	if(CurSysMode != MAINTAIN)
 		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLoadBank);
 
 	//Init Pushbtn
@@ -421,19 +442,19 @@ void initSetupSystem()
 }
 void initSetupInterrupts(void)
 {
-	//Frequency Analyser ISR
-	alt_irq_register(FREQUENCY_ANALYSER_IRQ,0, freq_relay);
+	/*Frequency Analyzer ISR*/
+	alt_irq_register(FREQUENCY_ANALYSER_IRQ,(void*)0, freq_relay);
 
-	//pushbtn interrupts for maintainence mode
+	/*Pushbutton interrupts,for maintenance mode*/
 	int buttonValue = 0;
 	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-	// enable interrupts for all buttons //TODO:specify wchich button.
-	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
+	// enable interrupts for all buttons
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);//enable interrupts for first btn on right side.
 	// register the ISR
-	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
+	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, pushbutton_ISR);
 
-	//Keyboard interrupts
+	/*Keyboard interrupts*/
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
 
 	if(ps2_device == NULL){
