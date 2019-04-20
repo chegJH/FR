@@ -12,11 +12,11 @@
 #include <tgmath.h>
 #include "system.h"
 #include "altera_avalon_pio_regs.h"
-#include "FreeRTOS/FreeRTOS.h"
-#include "FreeRTOS/task.h"
-#include "FreeRTOS/timers.h"
-#include "FreeRTOS/queue.h"
-#include "Freertos/semphr.h"
+#include "FreeRTOS_Source/include/FreeRTOS.h"
+#include "FreeRTOS_Source/include/task.h"
+#include "FreeRTOS_Source/include/timers.h"
+#include "FreeRTOS_Source/include/queue.h"
+#include "Freertos_Source/include/semphr.h"
 #include "io.h"
 #include "altera_up_avalon_ps2.h"
 #include <unistd.h>
@@ -31,9 +31,9 @@
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
 #define LoadManager_Task_P 		(tskIDLE_PRIORITY+5)
-#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+5)
+#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+4)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+4)
-#define UpdateScreen_P			(tskIDLE_PRIORITY+1)
+#define UpdateScreen_P			(tskIDLE_PRIORITY+4)
 //#define SystemMonitor_P			(tskIDLE_PRIORITY)
 
 
@@ -50,15 +50,12 @@ void initSetupSystem(void);
 TaskHandle_t xHandle_thresholdUpdate;
 TaskHandle_t xHandle_loadManager;
 TaskHandle_t xHandle_freqAnalazer;
+TaskHandle_t xHandle_systemCheck;
 
 /*Enum and Constants*/
 #define MaxRecordNum  5
 typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
 typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED_SysCon =2} SystemCondition;
-/* SystemCondition
- * 0, is unstable 1, stable 2, undefined.
- */
-//typedef int SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
 unsigned int redZeroMask = 0x0;
@@ -92,7 +89,6 @@ FreqInfo preFreq,curFreq;
 FreqInfo historyFreq[MaxRecordNum];
 
 /*Semaphore*/
-//SemaphoreHandle_t shareSource_LED_sem;
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -105,6 +101,8 @@ SystemCondition currentSysStability = STABLE;//1 for STABLE;
 SystemMode CurSysMode = RUN;
 //SystemMode PreSysMode;
 char keyInputbuffer[10] ;
+int keyInputIndex = 1;
+int keyInputSum = 0;
 
 //
 //enum LoadStatus{
@@ -153,7 +151,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  printf("CurSysMode = Run\n");
 		  CurSysMode= RUN;
 		  alt_irq_disable(PS2_IRQ);
-		  alt_irq_enable(FREQUENCY_ANALYSER_IRQ);
+//		  alt_irq_enable(FREQUENCY_ANALYSER_IRQ);
 		  printf("PS2 irq disabled\n");
 		  break;
 	  }
@@ -165,19 +163,19 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  printf("CurSysMode = Maintain\n");
 		  CurSysMode= MAINTAIN;
 		  alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
-		  alt_up_ps2_clear_fifo (ps2_device) ;
-		  alt_irq_enable(PS2_IRQ);
-		  alt_irq_disable(FREQUENCY_ANALYSER_IRQ);
+		  alt_up_ps2_clear_fifo (ps2_device) ; //clear keyboard input queue
+		  alt_irq_enable(PS2_IRQ); //enable keyboard interrupt
+//		  alt_irq_disable(FREQUENCY_ANALYSER_IRQ);
 		  printf("PS2 irq enabled\n");
 		  break;
 	  }
-	  (CurSysMode == RUN)? vTaskSuspend(xHandle_thresholdUpdate) : vTaskResume(xHandle_thresholdUpdate);
-
-//	  (CurSysMode == RUN)? vTaskResume(xHandle_loadManager) : vTaskSuspend(xHandle_loadManager);
-//	  (CurSysMode == RUN)? vTaskResume(xHandle_freqAnalazer) : vTaskSuspend(xHandle_freqAnalazer);
 	}
+	(CurSysMode == RUN)? vTaskSuspend(xHandle_thresholdUpdate) : vTaskResume(xHandle_thresholdUpdate);
+//	(CurSysMode == RUN)? vTaskResume(xHandle_loadManager) : vTaskSuspend(xHandle_loadManager);
+//	(CurSysMode == RUN)? vTaskResume(xHandle_freqAnalazer) : vTaskSuspend(xHandle_freqAnalazer);
 	// clears the edge capture register
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
 }
 /* KeyboardISR,
  * called when keyboard is pressed
@@ -190,25 +188,76 @@ void ps2_isr (void* context, alt_u32 id)
 	unsigned char key = 0;
 	KB_CODE_TYPE decode_mode;
 	status = decode_scancode (context, &decode_mode , &key , &ascii) ;
+//	int keyValue = 0;
 	if ( status == 0 ) //success
 	{
-	// print out the result
-		switch ( decode_mode )
-		{
-		  case KB_ASCII_MAKE_CODE :
-			if(CurSysMode == MAINTAIN){
-				xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);
-			}
-			printf ( "ASCII   : %x\t", key ) ;
-			break ;
-		  default :
-			printf ( "Int Form : %d\n", key ) ;
-			break ;
-		}
+		xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);//TODO: using SEVEN-segment up store and update threshold
+		printf ( "pushto Q_keyBoard  : hex:%x\t int:%d", key ,atoi(key)) ;
 	}
+
+	vTaskResume(xHandle_thresholdUpdate);
+	printf("\n task notified\n");
+
+	// print out the result
+//		switch ( decode_mode )
+//		{
+//		  case KB_ASCII_MAKE_CODE :
+//		  {
+//			if(CurSysMode == MAINTAIN)
+//			{
+//				switch((int)key)
+//				{
+//				case 22:{keyValue = 1; break;}
+//				case 30:{keyValue = 2; break;}
+//				case 38:{keyValue = 3; break;}
+//				case 37:{keyValue = 4; break;}
+//				case 46:{keyValue = 5; break;}
+//				case 54:{keyValue = 6; break;}
+//				case 61:{keyValue = 7; break;}
+//				case 62:{keyValue = 8; break;}
+//				case 70:{keyValue = 9; break;}
+//				case 90:{printf("Enter\n"); break;}
+//
+//				default:
+//					break;
+//				}
+//				{
+//					//when enter is not pressed
+//					if( (int)key != 90)
+//					{
+//						if (keyInputIndex >= 0 ){
+//							keyInputSum+= keyValue * pow(10,keyInputIndex);
+//							--keyInputIndex;
+//							printf("\t\tkeyInputSum=%d, keyInputIndex = %d\n",keyInputSum,keyInputIndex);
+//							unsigned int hex=0;
+//							itoa(keyInputSum,hex,16);
+//							IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,hex);
+//						}else{
+//							Threshold_Freq = keyInputSum;
+//							printf("Threshold set to %f\n",Threshold_Freq);
+//							keyInputIndex = 1;
+//							keyInputSum = 0;
+//						}
+//
+//					}
+//				}
+//				}
+//			}
+//
+//			printf ( "ASCII   : %x\t", key ) ;
+//			break ;
+//		  default :
+//			printf ( "Int Form : %d\n", key ) ;
+//			break ;
+//		}
+//	}
 }
+
+
+
+
 /* Frequency relay ISR
- * Record frequency value and time on interupt
+ * Record frequency value and time on interrupt
  */
 void freq_relay(void *pvParameters)
 {
@@ -222,14 +271,8 @@ void freq_relay(void *pvParameters)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
-//		PreSysMode = CurSysMode;
 	}
-//	else{
-//		if(PreSysMode != UNDEFINED && CurSysMode != PreSysMode){
-//			printf( "\n freq_relay, in maintain mode\n");
-//		}
-//	}
-	usleep(1000);
+	usleep(5000);
 }
 
 /*-------------TASKs--------------------*/
@@ -237,29 +280,35 @@ void freq_relay(void *pvParameters)
  * Since ps2_isr is collecting keyboard input into a buffer,
  * this update function scans the end of entry - a Enter '\n', ideally
  */
-void updateThreshold()
+void updateThreshold(void *pvParameters0)
 {
-	printf("\nUpdateThreshold\n");
-
+	double FREQ_CHANGE = 0.0;
+	double ROC_CHANGE = 0.0;
+	int numb = 0;
+	int len = 2;
+	int sum = 0;
 	while(1)
 	{
+		printf("\nUpdateThreshold\n");
 		if (CurSysMode == MAINTAIN)
 		{
-			//read threshold
-			int numb = 0;
-			int sum = 0;
-			for( int len = 0;xQueueReceive(Q_KeyboardInput,&numb,portMax_DELAY) == pdTRUE , numb != '\n'; ++len)
+			if ( xQueueReceive(Q_KeyboardInput,&numb,portMax_DELAY) == pdTRUE )
 			{
-				sum+=numb*len;
-				printf("numb = %d\t sum=%d\t len = %d\n",numb,sum);
+				printf("\t toke from Q_key : %d\n", atoi(numb));
+				if (atoi(numb) == 90)
+				{
+					printf("\nEnter pressed!\n");
+					Threshold_Freq = sum;
+					printf("Threshold_Freq sets to:%f", Threshold_Freq);
+					sum = 0; numb = 0; len =2;//reset
+				}else{
+//					sum+= atoi(numb)*pow(10,--len);
+					printf("numb = %d\t sum=%d\t len = %d\n", atoi(numb), sum);
+				}
 			}
-
-	//		if( Threshold_Freq)
-	//		{
-				//set system threshold
-			Threshold_Freq = sum;
-			printf("Threshold_Freq sets to:%c",Threshold_Freq);
-//			}
+		}else{
+			//wait
+			vTaskDelay(500);
 		}
 	}
 }
@@ -310,7 +359,6 @@ void freq_analyser(void *pvParameters)
 	}
 
 }
-
 /* Load manager
  * Control the load operation,
  * Read from Q_LoadOperation
@@ -374,7 +422,7 @@ void load_manager(void *pvParameters)
 								{
 									--dropCounter;
 									uiLoadBank += pow(2,dropCounter);//Add loads
-									printf("\n##STABLE-->Add loads, uiLoadBank=%d,dropCounter=%d ##\n",uiLoadBank,dropCounter);
+//									printf("\n##STABLE-->Add loads, uiLoadBank=%d,dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
 	//							xSemaphoreGive(shareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
@@ -403,7 +451,7 @@ void update_LED(void *pvParameters)
 	unsigned int uiSwitchValue;
 	unsigned int uiRedLED;
 	unsigned int uiGreenLED;
-	unsigned int uiSKPGreenLED;
+//	unsigned int uiSKPGreenLED;
 	/*indicate load condition with LEDs*/
 	while(1)
 	{
@@ -429,6 +477,14 @@ void update_LED(void *pvParameters)
 
 }
 
+/*System Check
+ * Checking the system operation status and make correction
+ */
+void system_checker(void *pvParameters)
+{
+
+}
+
 int main()
 {
 	printf("Hello Junjie!\n");
@@ -439,6 +495,7 @@ int main()
 	initCreateTask();
 	printf("\tinitCreateTask\n");
 	vTaskStartScheduler();
+	vTaskSuspend(xHandle_thresholdUpdate);
 	while (1)
 	{
 
@@ -451,7 +508,7 @@ int main()
 void initSetupSystem()
 {
 	//Start with Five loads, indicate by RED LEDs
-	//TODO:if not boot with maintainence mode
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,0);
 	uiLoadBank = redMask;
 	if(CurSysMode != MAINTAIN)
 		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLoadBank);
@@ -499,7 +556,7 @@ void initCreateTask()
 			configMINIMAL_STACK_SIZE,
 			NULL,
 			LoadManager_Task_P,
-			xHandle_loadManager );
+			&xHandle_loadManager );
 
 	xTaskCreate(
 			freq_analyser,
@@ -507,7 +564,7 @@ void initCreateTask()
 			configMINIMAL_STACK_SIZE,
 			NULL,
 			FreqAnalyser_Task_P,
-			xHandle_freqAnalazer );
+			&xHandle_freqAnalazer );
 
 	xTaskCreate(
 			update_LED,
@@ -516,13 +573,14 @@ void initCreateTask()
 			NULL,
 			UpdateLED_Task_P,
 			NULL );
+
 	xTaskCreate(
-				updateThreshold,
-				"updateLED_task",
-				configMINIMAL_STACK_SIZE,
-				NULL,
-				UpdateThresholds_P,
-				xHandle_thresholdUpdate );
+			updateThreshold,
+			"updateThreshold_task",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			UpdateThresholds_P,
+			&xHandle_thresholdUpdate );
 
 	//UpdateThresholds_P
 	//UpdateScreen_P
