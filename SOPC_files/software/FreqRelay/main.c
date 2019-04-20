@@ -54,11 +54,11 @@ void initSetupSystem(void);
 /*Enum and Constants*/
 #define MaxRecordNum  5
 typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
-//typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED=2} SystemCondition;
+typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED_SysCon =2} SystemCondition;
 /* SystemCondition
  * 0, is unstable 1, stable 2, undefined.
  */
-typedef int SystemCondition;
+//typedef int SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
 unsigned int redZeroMask = 0x0;
@@ -101,7 +101,7 @@ double Threshold_RoC = 5;
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
-SystemCondition currentSysStability = 1;//1 for STABLE;
+SystemCondition currentSysStability = STABLE;//1 for STABLE;
 SystemMode CurSysMode = RUN;
 //SystemMode PreSysMode;
 char keyInputbuffer[10] ;
@@ -122,7 +122,7 @@ unsigned int dropCounter = 0;
  * stores the previous system condition,
  * used to when to drop load
  */
-SystemCondition PreSysCon= 1;//STABLE;
+SystemCondition PreSysCon= STABLE;//STABLE;
 
 /*Timer*/
 //TimeHandler_t timer_System; // use vTaskTickCount
@@ -268,11 +268,11 @@ void freq_analyser(void *pvParameters)
 		}
 		if(curFreq.freq_value < Threshold_Freq || RoC > Threshold_RoC)
 		{
-			currentSysStability = 0;//UNSTABLE;
+			currentSysStability = UNSTABLE;//UNSTABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
 		}else{
-			currentSysStability = 1;//STABLE;
+			currentSysStability = STABLE;//STABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
 		}
@@ -289,14 +289,14 @@ void freq_analyser(void *pvParameters)
  */
 void load_manager(void *pvParameters)
 {
-	SystemCondition sysCon = 2;
+	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(CurSysMode == RUN)
 	{
 		if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 		{
 //			printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d dropCounter=%d freqThreshold=%d\n",sysCon,uiLoadBank,uiManageTime,dropCounter,Threshold_Freq);
 			switch(sysCon){
-				case 0: {
+				case UNSTABLE: {
 //					printf("sysCon=UNSTABLE\n");
 					if (sysCon != PreSysCon)
 					{
@@ -328,7 +328,7 @@ void load_manager(void *pvParameters)
 					PreSysCon = sysCon;
 					break;
 				}
-				case 1: {
+				case STABLE: {
 //					printf("sysCon=STABLE\n");
 					if (sysCon != PreSysCon)
 					{
@@ -352,7 +352,7 @@ void load_manager(void *pvParameters)
 					break;
 				}
 
-				case 2:{
+				case UNDEFINED:{
 					printf("sysCon doesn't get value!!!\n");
 					break;
 				}
@@ -435,7 +435,7 @@ void initSetupSystem()
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 	//Initiate Queues
 	Q_FreqInfo = xQueueCreate(1000,sizeof(FreqInfo));
-	Q_KeyboardInput = xQueueCreate(1000,sizeof(SystemCondition));
+	Q_KeyboardInput = xQueueCreate(1000,sizeof(char)*3);
 	Q_LoadOperation = xQueueCreate(1000,sizeof(int));
 	Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
 	Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
