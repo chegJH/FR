@@ -12,11 +12,11 @@
 #include <tgmath.h>
 #include "system.h"
 #include "altera_avalon_pio_regs.h"
-#include "FreeRTOS_Source/include/FreeRTOS.h"
-#include "FreeRTOS_Source/include/task.h"
-#include "FreeRTOS_Source/include/timers.h"
-#include "FreeRTOS_Source/include/queue.h"
-#include "Freertos_Source/include/semphr.h"
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/timers.h"
+#include "FreeRTOS/queue.h"
+#include "Freertos/semphr.h"
 #include "io.h"
 #include "altera_up_avalon_ps2.h"
 #include <unistd.h>
@@ -34,14 +34,15 @@
 #define UpdateLED_Task_P 		(tskIDLE_PRIORITY+4)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+4)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+4)
-//#define SystemMonitor_P			(tskIDLE_PRIORITY)
+#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+3)
 
 
 /*Functions*/
 //#define BGMASK				1 // enable this to print debug messages.
-void initCreateTask(void);
-void initSetupInterrupts(void);
-void initSetupSystem(void);
+void initTask(void);
+void initInterrupts(void);
+void initSystem(void);
+static void initKeyBDISR(void);
 
 
 
@@ -58,12 +59,6 @@ typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
 typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED_SysCon =2} SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
-unsigned int redZeroMask = 0x0;
-unsigned int redL1Mask = 0x10;
-unsigned int redL2Mask = 0x8;
-unsigned int redL3Mask = 0x4;
-unsigned int redL4Mask = 0x2;
-unsigned int redL5Mask = 0x1;
 
 /*DataType*/
 /*SysCond,
@@ -104,13 +99,6 @@ char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
 
-//
-//enum LoadStatus{
-//	OFF=0,
-//	ON,
-//	SHED,
-//} LoadBank[] = {ON,ON,ON,ON,ON};//NOTE: currently the uiLEDBank did the job
-
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
@@ -136,7 +124,7 @@ static QueueHandle_t Q_VGAUpdateTime;
 
 /*-------------Interrupts--------------------*/
 /* PushBtn ISR,
- * use to go into maintenence mode
+ * use to go into maintenance mode
  */
 void pushbutton_ISR(void* context, alt_u32 id)
 {
@@ -151,7 +139,6 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  printf("CurSysMode = Run\n");
 		  CurSysMode= RUN;
 		  alt_irq_disable(PS2_IRQ);
-//		  alt_irq_enable(FREQUENCY_ANALYSER_IRQ);
 		  printf("PS2 irq disabled\n");
 		  break;
 	  }
@@ -161,98 +148,39 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	  }
 	  case RUN : {
 		  printf("CurSysMode = Maintain\n");
-		  CurSysMode= MAINTAIN;
-		  alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
-		  alt_up_ps2_clear_fifo (ps2_device) ; //clear keyboard input queue
-		  alt_irq_enable(PS2_IRQ); //enable keyboard interrupt
-//		  alt_irq_disable(FREQUENCY_ANALYSER_IRQ);
-		  printf("PS2 irq enabled\n");
+		  CurSysMode = MAINTAIN;
+		  initKeyBDISR();
 		  break;
 	  }
 	}
-	(CurSysMode == RUN)? vTaskSuspend(xHandle_thresholdUpdate) : vTaskResume(xHandle_thresholdUpdate);
-//	(CurSysMode == RUN)? vTaskResume(xHandle_loadManager) : vTaskSuspend(xHandle_loadManager);
-//	(CurSysMode == RUN)? vTaskResume(xHandle_freqAnalazer) : vTaskSuspend(xHandle_freqAnalazer);
 	// clears the edge capture register
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+//	vTaskNotifyGiveFromISR(xHandle_systemCheck,SystemChecker_Task_P);
 
 }
 /* KeyboardISR,
  * called when keyboard is pressed
+ * fill the Q_KeyboardInput with pressed raw value
  */
 void ps2_isr (void* context, alt_u32 id)
 {
-	printf("\nKeyPressed:\t");
-	char ascii;
-	int status = 0;
-	unsigned char key = 0;
-	KB_CODE_TYPE decode_mode;
-	status = decode_scancode (context, &decode_mode , &key , &ascii) ;
-//	int keyValue = 0;
-	if ( status == 0 ) //success
+	printf("\nps2_isr:\t");
+	unsigned char byte, tempChar;
+	int invalidKey = 1;
+	alt_up_ps2_read_data_byte_timeout(PS2_KEYBOARD, &byte);
+	tempChar = byte;
+	//filte out invalid values
+	if(byte > 0x7F)
 	{
-		xQueueSendToBackFromISR(Q_KeyboardInput, &key, pdFALSE);//TODO: using SEVEN-segment up store and update threshold
-		printf ( "pushto Q_keyBoard  : hex:%x\t int:%d", key ,atoi(key)) ;
+		if ( (byte == 0xF0 ) || (byte == 0XE0 ) )
+		{
+			invalidKey = 1;
+		}return;
 	}
-
-	vTaskResume(xHandle_thresholdUpdate);
-	printf("\n task notified\n");
-
-	// print out the result
-//		switch ( decode_mode )
-//		{
-//		  case KB_ASCII_MAKE_CODE :
-//		  {
-//			if(CurSysMode == MAINTAIN)
-//			{
-//				switch((int)key)
-//				{
-//				case 22:{keyValue = 1; break;}
-//				case 30:{keyValue = 2; break;}
-//				case 38:{keyValue = 3; break;}
-//				case 37:{keyValue = 4; break;}
-//				case 46:{keyValue = 5; break;}
-//				case 54:{keyValue = 6; break;}
-//				case 61:{keyValue = 7; break;}
-//				case 62:{keyValue = 8; break;}
-//				case 70:{keyValue = 9; break;}
-//				case 90:{printf("Enter\n"); break;}
-//
-//				default:
-//					break;
-//				}
-//				{
-//					//when enter is not pressed
-//					if( (int)key != 90)
-//					{
-//						if (keyInputIndex >= 0 ){
-//							keyInputSum+= keyValue * pow(10,keyInputIndex);
-//							--keyInputIndex;
-//							printf("\t\tkeyInputSum=%d, keyInputIndex = %d\n",keyInputSum,keyInputIndex);
-//							unsigned int hex=0;
-//							itoa(keyInputSum,hex,16);
-//							IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,hex);
-//						}else{
-//							Threshold_Freq = keyInputSum;
-//							printf("Threshold set to %f\n",Threshold_Freq);
-//							keyInputIndex = 1;
-//							keyInputSum = 0;
-//						}
-//
-//					}
-//				}
-//				}
-//			}
-//
-//			printf ( "ASCII   : %x\t", key ) ;
-//			break ;
-//		  default :
-//			printf ( "Int Form : %d\n", key ) ;
-//			break ;
-//		}
-//	}
+	xQueueSendToBackFromISR(Q_KeyboardInput, &tempChar,pdFALSE);
+	printf(" key : %x ",tempChar);
+	invalidKey ? 0 : 1;
 }
-
 
 
 
@@ -277,38 +205,44 @@ void freq_relay(void *pvParameters)
 
 /*-------------TASKs--------------------*/
 /* updateThreshold,
- * Since ps2_isr is collecting keyboard input into a buffer,
- * this update function scans the end of entry - a Enter '\n', ideally
+ * Read from Q_KeyboardInput, figure out new threshold
+ * New value end with "ENTER" key
  */
-void updateThreshold(void *pvParameters0)
+void updateThreshold(void *pvParameters)
 {
-	double FREQ_CHANGE = 0.0;
-	double ROC_CHANGE = 0.0;
-	int numb = 0;
-	int len = 2;
+//	double FREQ_CHANGE = 0.0;
+//	double ROC_CHANGE = 0.0;
+	int key_q = 0;
+	int index = 0;
 	int sum = 0;
+	int temp[4];
 	while(1)
 	{
 		printf("\nUpdateThreshold\n");
 		if (CurSysMode == MAINTAIN)
 		{
-			if ( xQueueReceive(Q_KeyboardInput,&numb,portMax_DELAY) == pdTRUE )
+			if ( xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY) == pdTRUE )
 			{
-				printf("\t toke from Q_key : %d\n", atoi(numb));
-				if (atoi(numb) == 90)
+				printf("\t key is: %d \t",key_q);
+				//Determine whether Enter is pressed
+				if ( key_q == 90)
 				{
-					printf("\nEnter pressed!\n");
+					printf("\t 'Enter' detected! ");
 					Threshold_Freq = sum;
-					printf("Threshold_Freq sets to:%f", Threshold_Freq);
-					sum = 0; numb = 0; len =2;//reset
+					printf("New Threshold sets to:%f", Threshold_Freq);
+					sum = 0; key_q = 0; index =0;//reset
 				}else{
-//					sum+= atoi(numb)*pow(10,--len);
-					printf("numb = %d\t sum=%d\t len = %d\n", atoi(numb), sum);
+					temp[index] = key_q;
+					++index;
+					printf("\n\ttemp:\t");
+					for( int i=0; i<index;++i){
+						printf("temp[%d]=%d ",i,temp[i]);
+					}
 				}
 			}
 		}else{
-			//wait
-			vTaskDelay(500);
+			printf("\t\tupdateThreshold triggered in RUN mode, task suspend\n");
+			vTaskSuspend(NULL);
 		}
 	}
 }
@@ -479,23 +413,49 @@ void update_LED(void *pvParameters)
 
 /*System Check
  * Checking the system operation status and make correction
+ * Manage updateThreshold operation
  */
 void system_checker(void *pvParameters)
 {
+	SystemMode prevMode;
+	while(1)
+	{
+		printf("\n System Checker\t");
+
+		if (CurSysMode != prevMode)
+		{
+			if (CurSysMode == RUN)
+			{
+				alt_irq_disable(PS2_IRQ);
+				printf("\n Disable ps2_irq\n");
+				vTaskSuspend(xHandle_thresholdUpdate);
+				printf("thresholdUpdate suspended\n");
+				prevMode = CurSysMode;
+			}
+			/*In Maintenance mode*/
+			else
+			{
+				initKeyBDISR();
+				vTaskResume(xHandle_thresholdUpdate);
+				printf("thresholdUpdate resumed\n");
+				prevMode = CurSysMode;
+			}
+		}
+//		vTaskSuspend(NULL);
+	}
 
 }
 
 int main()
 {
 	printf("Hello Junjie!\n");
-	initSetupSystem();
+	initSystem();
 	printf("\tinitSetupSystem\n");
-	initSetupInterrupts();
+	initInterrupts();
 	printf("\tinitSetupInterrupts\n");
-	initCreateTask();
+	initTask();
 	printf("\tinitCreateTask\n");
 	vTaskStartScheduler();
-	vTaskSuspend(xHandle_thresholdUpdate);
 	while (1)
 	{
 
@@ -505,7 +465,7 @@ int main()
 }
 
 /*--------------------Inits--------------------*/
-void initSetupSystem()
+void initSystem()
 {
 	//Start with Five loads, indicate by RED LEDs
 	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,0);
@@ -523,33 +483,44 @@ void initSetupSystem()
 	Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
 	Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
 }
-void initSetupInterrupts(void)
+void initInterrupts(void)
 {
 	/*Frequency Analyzer ISR*/
-	alt_irq_register(FREQUENCY_ANALYSER_IRQ,(void*)0, freq_relay);
+		alt_irq_register(FREQUENCY_ANALYSER_IRQ,(void*)0, freq_relay);
 
 	/*Pushbutton interrupts,for maintenance mode*/
-	int buttonValue = 0;
-	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-	// enable interrupts for all buttons
-	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);//enable interrupts for first btn on right side.
-	// register the ISR
-	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, pushbutton_ISR);
+		int buttonValue = 0;
+		// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
+		IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+		// enable interrupts for all buttons
+		IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);//enable interrupts for first btn on right side.
+		// register the ISR
+		alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, pushbutton_ISR);
 
 	/*Keyboard interrupts*/
+		initKeyBDISR();
+}
+static void initKeyBDISR()
+{
+	/*Keyboard interrupts*/
 		alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
-		if(ps2_device == NULL){
-			printf("\ncan't find PS/2 device\n");
-		}
+		if(ps2_device == NULL){			printf("\ncan't find PS/2 device\n");		}
 		alt_up_ps2_clear_fifo (ps2_device) ;
 		alt_irq_register(PS2_IRQ, ps2_device, ps2_isr); //only enabled in maintain mode
-	(CurSysMode == MAINTAIN)? alt_irq_enable(PS2_IRQ) : alt_irq_disable(PS2_IRQ);
-
-	IOWR_8DIRECT(PS2_BASE,4,1);
+		(CurSysMode == MAINTAIN)? alt_irq_enable(PS2_IRQ) : alt_irq_disable(PS2_IRQ);
+		IOWR_8DIRECT(PS2_BASE,4,1);
+		printf("Enable ps2_irq\n");
 }
-void initCreateTask()
+void initTask()
 {
+	xTaskCreate(
+			system_checker,
+			"systemChecker_TASK",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			SystemChecker_Task_P,
+			&xHandle_systemCheck );
+
 	xTaskCreate(
 			load_manager,
 			"LoadManager_TASK",
@@ -581,18 +552,7 @@ void initCreateTask()
 			NULL,
 			UpdateThresholds_P,
 			&xHandle_thresholdUpdate );
-
-	//UpdateThresholds_P
 	//UpdateScreen_P
 
 }
 
-//int debugPrint(const &string str)
-//{
-//	if (BGMSK)
-//	{
-//		printf(str);
-//		printf("\n");
-//	}
-//	return 0;
-//}
