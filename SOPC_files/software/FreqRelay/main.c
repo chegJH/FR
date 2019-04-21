@@ -31,10 +31,10 @@
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
 #define LoadManager_Task_P 		(tskIDLE_PRIORITY+5)
-#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+4)
-#define UpdateThresholds_P		(tskIDLE_PRIORITY+4)
+#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+5)
+#define UpdateThresholds_P		(tskIDLE_PRIORITY+5)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+4)
-#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+3)
+#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+1)
 
 
 /*Functions*/
@@ -42,6 +42,7 @@
 void initTask(void);
 void initInterrupts(void);
 void initSystem(void);
+void initSharedResources(void);
 static void initKeyBDISR(void);
 
 
@@ -89,7 +90,8 @@ SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update proc
 /*Threshold*/
 double Threshold_Freq = 50;
 double Threshold_RoC = 5;
-
+char userInputTarget[20] = "Frequency Threshold";
+int currentNumber = 0;
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
@@ -99,6 +101,33 @@ SystemMode CurSysMode = RUN;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
+// Keyboard Scan Code Lookup Table
+#define TAB 0x09 // Tab
+#define BKSP 0x08 // Backspace
+#define ENTER 0x0d // Enter
+#define ESC 0x1b // Escape
+#define BKSL 0x5c // Backslash
+
+const char strToAscii[128] =
+{						//Leftmost value
+	0, 0, 0, 0, 0, 0, 0, 0,		 //00
+	0, 0, 0, 0, 0, 0, 0, 0, //08
+	0, 0, 0, 0, 0, 'q', '1', 0, //10
+	0, 0, 'z', 's', 'a', 'w', '2', 0, //18
+	0, 'c', 'x', 'd', 'e', '4', '3', 0, //20
+	0, ' ', 'v', 'f', 't', 'r', '5', 0, //28
+	0, 'n', 'b', 'h', 'g', 'y', '6', 0, //30
+	0, 0, 'm', 'j', 'u', '7', '8', 0, //38
+	0, ',', 'k', 'i', 'o', '0', '9', 0, //40
+	0, '.', '/', 'l', ';', 'p', '-', 0, //48
+	0, '.', '/', 'l', ';', 'p', '-', 0, //48
+	//0, 0, '\'', 0, '[', '\=', 0, 0, //50
+	0, 0, ENTER, ']', 0, BKSL, 0, 0, //58
+	0, 0, 0, 0, 0, 0, BKSP, 0, //60
+	0, '1', 0, '4', '7', 0, 0, 0, //68
+	'0', '.', '2', '5', '6', '8', ESC, 0, //70
+	0, '+', '3', '-', '*', '9', 0, 0 //78
+};
 
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
@@ -141,7 +170,9 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  printf("CurSysMode = Run\n");
 		  CurSysMode= RUN;
 		  alt_irq_disable(PS2_IRQ);
-		  printf("PS2 irq disabled\n");
+//		  printf("PS2 irq disabled\n");
+//		  xSemaphoreTakeFromISR(SharedSource_KB_update,UpdateThresholds_P);
+		  printf("SEM took in pushbtn fn\n");
 		  break;
 	  }
 	  case UNDEFINED : {
@@ -151,14 +182,17 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	  case RUN : {
 		  printf("CurSysMode = Maintain\n");
 		  CurSysMode = MAINTAIN;
-		  initKeyBDISR();
+//		  initKeyBDISR();
+		  alt_irq_enable(PS2_IRQ);
+		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+		  printf("SEM given in pushbtn fn\n");
 		  break;
 	  }
 	}
 	// clears the edge capture register
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 //	vTaskNotifyGiveFromISR(xHandle_systemCheck,SystemChecker_Task_P);
-
+	return;
 }
 /* KeyboardISR,
  * called when keyboard is pressed
@@ -167,12 +201,12 @@ void pushbutton_ISR(void* context, alt_u32 id)
 void ps2_isr (void* context, alt_u32 id)
 {
 	printf("\nps2_isr:\t");
-	unsigned char byte, tempChar;
+	unsigned char byte, temp;
+	temp = byte;
 	int invalidKey = 1;
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
 	alt_up_ps2_read_data_byte_timeout(ps2_device, &byte);
 	printf("Scan code: %x\n", byte);
-	tempChar = byte;
 	//filte out invalid values
 	if(byte > 0x7F)
 	{
@@ -181,9 +215,13 @@ void ps2_isr (void* context, alt_u32 id)
 			invalidKey = 1;
 		}return;
 	}
-	xQueueSendToBackFromISR(Q_KeyboardInput, &tempChar,pdFALSE);
-	printf(" key : %x \n",tempChar);
+	xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
+	if (byte == 0x5a){
+		//TODO: notify the updateThreshold task to run.
+		xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+	}
 	invalidKey ? 0 : 1;
+	return;
 }
 
 
@@ -206,6 +244,7 @@ void freq_relay(void *pvParameters)
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
 	}
 	usleep(5000);
+	return;
 }
 
 /*-------------TASKs--------------------*/
@@ -215,41 +254,33 @@ void freq_relay(void *pvParameters)
  */
 void updateThreshold(void *pvParameters)
 {
-//	double FREQ_CHANGE = 0.0;
-//	double ROC_CHANGE = 0.0;
-	int key_q = 0;
+	char key_q = 0;
 	int index = 0;
-	int sum = 0;
-	int temp[4];
+	char temp[10];
 	while(1)
 	{
-		printf("\nUpdateThreshold\n");
-		if (CurSysMode == MAINTAIN)
+		printf("\nUpdateThreshold\t");
+		printf("\t try to get sem\n");
+		xSemaphoreTake(SharedSource_KB_update, portMax_DELAY);
+		printf("\t Got sem\n");
+		while(uxQueueMessagesWaiting(Q_KeyboardInput) != pdFALSE)
 		{
-			if ( xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY) == pdTRUE )
+			printf("some queue message\n");
+			for ( int sum = 0;
+					xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY) == pdFALSE;
+					++index)
 			{
-				printf("\t key is: %d \t",key_q);
-				//Determine whether Enter is pressed
-				if ( key_q == 90)
-				{
-					printf("\t 'Enter' detected! ");
-					Threshold_Freq = sum;
-					printf("New Threshold sets to:%f", Threshold_Freq);
-					sum = 0; key_q = 0; index =0;//reset
-				}else{
-					temp[index] = key_q;
-					++index;
-					printf("\n\ttemp:\t");
-					for( int i=0; i<index;++i){
-						printf("temp[%d]=%d ",i,temp[i]);
-					}
-				}
+				temp[index%10]=key_q;
 			}
-		}else{
-			printf("\t\tupdateThreshold triggered in RUN mode, task suspend\n");
-			vTaskSuspend(NULL);
 		}
+		for( int i=0; i<index;++i){
+			printf("temp[%d]=%d ",i,temp[i]);
+		}
+//		xSemaphoreGive(SharedSource_KB_update);
+//		printf("\t give sem\n");
 	}
+//	vTaskDelay(5000);
+	return;
 }
 
 /* Frequency analyser
@@ -296,6 +327,7 @@ void freq_analyser(void *pvParameters)
 //			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
 		}
 	}
+	return;
 
 }
 /* Load manager
@@ -385,6 +417,7 @@ void load_manager(void *pvParameters)
 			}
 		}
 	}
+	return;
 }
 /* UpdateLED
  * Read the switch value
@@ -397,16 +430,13 @@ void update_LED(void *pvParameters)
 	unsigned int uiSwitchValue;
 	unsigned int uiRedLED;
 	unsigned int uiGreenLED;
-//	unsigned int uiSKPGreenLED;
 	/*indicate load condition with LEDs*/
 	while(1)
 	{
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
 //			xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-//			uiSKPGreenLED = ~(uiSwitchValue & redMask);
 			uiRedLED = uiSwitchValue & uiLoadBank;
-//			uiGreenLED = (uiLoadBank ^ redMask);
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
 		if(currentSysStability == 1)
 		{
@@ -416,14 +446,13 @@ void update_LED(void *pvParameters)
 		}else{
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
 			if (isFirstUpdate){
-				uiDropLoadTime = (xTaskGetTickCount()-uiDropLoadTime)/1000;
+				uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime)/1000;
 			}
 			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 		}
-//			xSemaphoreGive(shareSource_LED_sem);
 	}
 			printf("update_LED,system unstable");
-
+			return;
 }
 
 /*System Check
@@ -458,7 +487,7 @@ void system_checker(void *pvParameters)
 		}
 //		vTaskSuspend(NULL);
 	}
-
+	return;
 }
 
 int main()
@@ -470,6 +499,9 @@ int main()
 	printf("\tinitSetupInterrupts\n");
 	initTask();
 	printf("\tinitCreateTask\n");
+	initSharedResources();
+//	xSemaphoreTake(SharedSource_KB_update,portMax_DELAY);
+	printf("\tinitSharedResources\n");
 	vTaskStartScheduler();
 	while (1)
 	{
@@ -497,6 +529,7 @@ void initSystem()
 		Q_LoadOperation = xQueueCreate(1000,sizeof(int));
 		Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
 		Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
+		return;
 }
 void initInterrupts(void)
 {
@@ -513,7 +546,9 @@ void initInterrupts(void)
 		alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, pushbutton_ISR);
 
 	/*Keyboard interrupts*/
-//		initKeyBDISR();
+		initKeyBDISR();
+		alt_irq_disable(PS2_IRQ);
+		return;
 }
 static void initKeyBDISR()
 {
@@ -525,6 +560,13 @@ static void initKeyBDISR()
 		(CurSysMode == MAINTAIN)? alt_irq_enable(PS2_IRQ) : alt_irq_disable(PS2_IRQ);
 		IOWR_8DIRECT(PS2_BASE,4,1);
 		printf("Enable ps2_irq\n");
+		return;
+}
+
+void initSharedResources()
+{
+	vSemaphoreCreateBinary(SharedSource_KB_update);
+	return;
 }
 void initTask()
 {
@@ -568,6 +610,7 @@ void initTask()
 			UpdateThresholds_P,
 			&xHandle_thresholdUpdate );
 	//UpdateScreen_P
+	return;
 
 }
 
