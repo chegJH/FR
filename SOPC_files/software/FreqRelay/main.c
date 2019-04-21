@@ -87,6 +87,7 @@ FreqInfo historyFreq[MaxRecordNum];
 
 /*Semaphore*/
 SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update procedure.
+SemaphoreHandle_t SharedSource_LCD_show; //use to gard lcd usage.
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -141,6 +142,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	// need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+	xSemaphoreTakeFromISR(SharedSource_LCD_show,pdFALSE);
 	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	switch(CurSysMode)
 	{
@@ -150,6 +152,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  alt_irq_disable(PS2_IRQ);
 		  fprintf(lcd, "%c RUN mode",esc);
 		  fclose(lcd);
+		  xSemaphoreGiveFromISR(SharedSource_LCD_show,pdFALSE);
 		  break;
 	  }
 	  case UNDEFINED : {
@@ -159,11 +162,12 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	  case RUN : {
 		  printf("CurSysMode = Maintain\n");
 		  CurSysMode = MAINTAIN;
-		  fprintf(lcd, "%c%s %s",esc,"[2J","Maintenance");
+		  fprintf(lcd, "%c%s %s",esc,"[2J","Maintenance\nEnter r or f\n");
 		  fclose(lcd);
 		  alt_irq_enable(PS2_IRQ);
 		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
 		  printf("SEM given in pushbtn fn\n");
+		  xSemaphoreGiveFromISR(SharedSource_LCD_show,pdFALSE);
 		  break;
 	  }
 	}
@@ -209,7 +213,7 @@ void ps2_isr (void* context, alt_u32 id)
 	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	if (byte == 0x5a){
 		//TODO: notify the updateThreshold task to run.
-		xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+		fclose(lcd);
 		return;
 	}
 	else if ( byte == 0x2d){
@@ -227,6 +231,8 @@ void ps2_isr (void* context, alt_u32 id)
 	}else if ( byte == 0x49){
 		printf("\t DOT\n");
 		Threshold_dec = true;
+		fclose(lcd);
+		return;
 	}
 	return;
 }
@@ -307,6 +313,7 @@ void updateThreshold(void *pvParameters)
 		}
 //		printf("threshold=%f",(double)(threshold/10));
 		//prepare LCD for display threshold
+		xSemaphoreTake(SharedSource_LCD_show,pdFALSE);
 		FILE* fp;
 		fp = fopen(CHARACTER_LCD_NAME, "w"); //open the character LCD as a file stream for write
 
@@ -315,13 +322,13 @@ void updateThreshold(void *pvParameters)
 		}
 		if (setFreqOrRoc == 'r')
 		{
-			Threshold_RoC = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/100.0) ;
+			Threshold_RoC = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/10.0) ;
 			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
 			printf("ROC=%f",Threshold_RoC);
 		}
 		else if(setFreqOrRoc == 'f')
 		{
-			Threshold_Freq = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/100.0) ;
+			Threshold_Freq = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/10.0) ;
 			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
 			printf("Freq=%f",Threshold_Freq);
 		}
@@ -331,6 +338,7 @@ void updateThreshold(void *pvParameters)
 		}
 		setFreqOrRoc = 'N';
 		fclose(fp);
+		xSemaphoreGive(SharedSource_LCD_show);
 		++updateCounter;
 		Threshold_dec = false;
 //		printf("updateCounter = %d\n",updateCounter);
@@ -624,6 +632,7 @@ static void initKeyBDISR()
 void initSharedResources()
 {
 	vSemaphoreCreateBinary(SharedSource_KB_update);
+	vSemaphoreCreateBinary(SharedSource_LCD_show);
 	return;
 }
 void initTask()
