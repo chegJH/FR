@@ -84,6 +84,7 @@ FreqInfo preFreq,curFreq;
 FreqInfo historyFreq[MaxRecordNum];
 
 /*Semaphore*/
+SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update procedure.
 
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -102,6 +103,7 @@ int keyInputSum = 0;
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
+unsigned int uiDropLoadTime = 0; //stores the time cost of load dropping. in sec.
 unsigned int dropCounter = 0;
 
 /*PreSysCon,
@@ -167,7 +169,9 @@ void ps2_isr (void* context, alt_u32 id)
 	printf("\nps2_isr:\t");
 	unsigned char byte, tempChar;
 	int invalidKey = 1;
-	alt_up_ps2_read_data_byte_timeout(PS2_KEYBOARD, &byte);
+	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
+	alt_up_ps2_read_data_byte_timeout(ps2_device, &byte);
+	printf("Scan code: %x\n", byte);
 	tempChar = byte;
 	//filte out invalid values
 	if(byte > 0x7F)
@@ -178,7 +182,7 @@ void ps2_isr (void* context, alt_u32 id)
 		}return;
 	}
 	xQueueSendToBackFromISR(Q_KeyboardInput, &tempChar,pdFALSE);
-	printf(" key : %x ",tempChar);
+	printf(" key : %x \n",tempChar);
 	invalidKey ? 0 : 1;
 }
 
@@ -186,6 +190,7 @@ void ps2_isr (void* context, alt_u32 id)
 
 /* Frequency relay ISR
  * Record frequency value and time on interrupt
+ * Stores data into Q_FreqInfo
  */
 void freq_relay(void *pvParameters)
 {
@@ -261,7 +266,7 @@ void freq_analyser(void *pvParameters)
 
 	/* read from queue
 	 * First check the current reading, if it's lower than threshold, call load ctr
-	 * If the avaliable data is more than 2, calculate RoC
+	 * If the available data is more than 2, calculate RoC
 	 */
 	while (1)
 	{
@@ -300,6 +305,8 @@ void freq_analyser(void *pvParameters)
  */
 void load_manager(void *pvParameters)
 {
+	bool isFirstLoadDrop = true;
+
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
@@ -319,6 +326,10 @@ void load_manager(void *pvParameters)
 								/*Drop very first load, the load is not dropped until update_led process it */
 	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								uiLoadBank -= (unsigned int)pow(2,dropCounter);
+								if (isFirstLoadDrop){
+									uiDropLoadTime = xTaskGetTickCount();
+									isFirstLoadDrop = false;
+								}
 								++dropCounter;
 	//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
 	//							xSemaphoreGive(shareSource_LED_sem);
@@ -381,6 +392,7 @@ void load_manager(void *pvParameters)
  */
 void update_LED(void *pvParameters)
 {
+	bool isFirstUpdate = true;
 	printf("update LED\n");
 	unsigned int uiSwitchValue;
 	unsigned int uiRedLED;
@@ -403,6 +415,9 @@ void update_LED(void *pvParameters)
 			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 		}else{
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
+			if (isFirstUpdate){
+				uiDropLoadTime = (xTaskGetTickCount()-uiDropLoadTime)/1000;
+			}
 			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 		}
 //			xSemaphoreGive(shareSource_LED_sem);
@@ -467,21 +482,21 @@ int main()
 /*--------------------Inits--------------------*/
 void initSystem()
 {
-	//Start with Five loads, indicate by RED LEDs
-	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,0);
-	uiLoadBank = redMask;
-	if(CurSysMode != MAINTAIN)
-		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLoadBank);
+	/*Start with Five loads, indicate by RED LEDs*/
+//		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,0);
+		uiLoadBank = redMask;
+		if(CurSysMode != MAINTAIN)
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLoadBank);
 
-	//Init Pushbtn
-	// clears the edge capture register
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-	//Initiate Queues
-	Q_FreqInfo = xQueueCreate(1000,sizeof(FreqInfo));
-	Q_KeyboardInput = xQueueCreate(1000,sizeof(char));
-	Q_LoadOperation = xQueueCreate(1000,sizeof(int));
-	Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
-	Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
+	/*Init Pushbtn*/
+		// clears the edge capture register
+		IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+	/*Initiate Queues*/
+		Q_FreqInfo = xQueueCreate(1000,sizeof(FreqInfo));
+		Q_KeyboardInput = xQueueCreate(1000,sizeof(char));
+		Q_LoadOperation = xQueueCreate(1000,sizeof(int));
+		Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
+		Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
 }
 void initInterrupts(void)
 {
@@ -498,7 +513,7 @@ void initInterrupts(void)
 		alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, pushbutton_ISR);
 
 	/*Keyboard interrupts*/
-		initKeyBDISR();
+//		initKeyBDISR();
 }
 static void initKeyBDISR()
 {
@@ -513,13 +528,13 @@ static void initKeyBDISR()
 }
 void initTask()
 {
-	xTaskCreate(
-			system_checker,
-			"systemChecker_TASK",
-			configMINIMAL_STACK_SIZE,
-			NULL,
-			SystemChecker_Task_P,
-			&xHandle_systemCheck );
+//	xTaskCreate(
+//			system_checker,
+//			"systemChecker_TASK",
+//			configMINIMAL_STACK_SIZE,
+//			NULL,
+//			SystemChecker_Task_P,
+//			&xHandle_systemCheck );
 
 	xTaskCreate(
 			load_manager,
