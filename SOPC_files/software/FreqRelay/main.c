@@ -60,6 +60,7 @@ typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
 typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED_SysCon =2} SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
+static unsigned char esc = 0x1b;
 
 /*DataType*/
 /*SysCond,
@@ -90,44 +91,21 @@ SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update proc
 /*Threshold*/
 double Threshold_Freq = 50;
 double Threshold_RoC = 5;
-char userInputTarget[20] = "Frequency Threshold";
-int currentNumber = 0;
+bool Threshold_dec = false;
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
 SystemCondition currentSysStability = STABLE;//1 for STABLE;
 SystemMode CurSysMode = RUN;
-//SystemMode PreSysMode;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
-// Keyboard Scan Code Lookup Table
-#define TAB 0x09 // Tab
-#define BKSP 0x08 // Backspace
-#define ENTER 0x0d // Enter
-#define ESC 0x1b // Escape
-#define BKSL 0x5c // Backslash
 
-const char strToAscii[128] =
-{						//Leftmost value
-	0, 0, 0, 0, 0, 0, 0, 0,		 //00
-	0, 0, 0, 0, 0, 0, 0, 0, //08
-	0, 0, 0, 0, 0, 'q', '1', 0, //10
-	0, 0, 'z', 's', 'a', 'w', '2', 0, //18
-	0, 'c', 'x', 'd', 'e', '4', '3', 0, //20
-	0, ' ', 'v', 'f', 't', 'r', '5', 0, //28
-	0, 'n', 'b', 'h', 'g', 'y', '6', 0, //30
-	0, 0, 'm', 'j', 'u', '7', '8', 0, //38
-	0, ',', 'k', 'i', 'o', '0', '9', 0, //40
-	0, '.', '/', 'l', ';', 'p', '-', 0, //48
-	0, '.', '/', 'l', ';', 'p', '-', 0, //48
-	//0, 0, '\'', 0, '[', '\=', 0, 0, //50
-	0, 0, ENTER, ']', 0, BKSL, 0, 0, //58
-	0, 0, 0, 0, 0, 0, BKSP, 0, //60
-	0, '1', 0, '4', '7', 0, 0, 0, //68
-	'0', '.', '2', '5', '6', '8', ESC, 0, //70
-	0, '+', '3', '-', '*', '9', 0, 0 //78
-};
+/*For Threshold setting,
+ * setFreqOrRoc = r/R for setting RoC threshold
+ * setFreqOrRoc = f/F for setting Frequency threshold
+ */
+char setFreqOrRoc = 'N';
 
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
@@ -163,16 +141,15 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	// need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-
+	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	switch(CurSysMode)
 	{
 	  case MAINTAIN : {
 		  printf("CurSysMode = Run\n");
 		  CurSysMode= RUN;
 		  alt_irq_disable(PS2_IRQ);
-//		  printf("PS2 irq disabled\n");
-//		  xSemaphoreTakeFromISR(SharedSource_KB_update,UpdateThresholds_P);
-		  printf("SEM took in pushbtn fn\n");
+		  fprintf(lcd, "%c RUN mode",esc);
+		  fclose(lcd);
 		  break;
 	  }
 	  case UNDEFINED : {
@@ -182,13 +159,15 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	  case RUN : {
 		  printf("CurSysMode = Maintain\n");
 		  CurSysMode = MAINTAIN;
-//		  initKeyBDISR();
+		  fprintf(lcd, "%c%s %s",esc,"[2J","Maintenance");
+		  fclose(lcd);
 		  alt_irq_enable(PS2_IRQ);
 		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
 		  printf("SEM given in pushbtn fn\n");
 		  break;
 	  }
 	}
+
 	// clears the edge capture register
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 //	vTaskNotifyGiveFromISR(xHandle_systemCheck,SystemChecker_Task_P);
@@ -203,24 +182,52 @@ void ps2_isr (void* context, alt_u32 id)
 	printf("\nps2_isr:\t");
 	unsigned char byte, temp;
 	temp = byte;
-	int invalidKey = 1;
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
 	alt_up_ps2_read_data_byte_timeout(ps2_device, &byte);
 	printf("Scan code: %x\n", byte);
 	//filte out invalid values
-	if(byte > 0x7F)
-	{
-		if ( (byte == 0xF0 ) || (byte == 0XE0 ) )
+	switch (byte){
+		case 0x16:
+		case 0x1e:
+		case 0x26:
+		case 0x25:
+		case 0x2e:
+		case 0x36:
+		case 0x3d:
+		case 0x3e:
+		case 0x46:
+		case 0x45:
 		{
-			invalidKey = 1;
-		}return;
+			xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
+			break;
+		}
 	}
-	xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
+	//1to0	16,1e,26,25,...etc
+	//R = 0x2d
+	//F = 0x2b
+	//Enter = 0x5a
+	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	if (byte == 0x5a){
 		//TODO: notify the updateThreshold task to run.
 		xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+		return;
 	}
-	invalidKey ? 0 : 1;
+	else if ( byte == 0x2d){
+		printf("\t setting for Roc threshold\n");
+		fprintf(lcd,"%c%s %s",esc,"[2J","Set Roc \n");
+		fclose(lcd);
+		setFreqOrRoc = 'r';
+		return;
+	}else if( byte == 0x2b){
+		printf("\t setting for Frequency threshold\n");
+		fprintf(lcd,"%c%s %s",esc,"[2J","Set Freq \n");
+		fclose(lcd);
+		setFreqOrRoc = 'f';
+		return;
+	}else if ( byte == 0x49){
+		printf("\t DOT\n");
+		Threshold_dec = true;
+	}
 	return;
 }
 
@@ -254,30 +261,79 @@ void freq_relay(void *pvParameters)
  */
 void updateThreshold(void *pvParameters)
 {
-	char key_q = 0;
-	int index = 0;
-	char temp[10];
+	int updateCounter = 0;
 	while(1)
 	{
 		printf("\nUpdateThreshold\t");
-		printf("\t try to get sem\n");
 		xSemaphoreTake(SharedSource_KB_update, portMax_DELAY);
-		printf("\t Got sem\n");
+		char key_q = 0;
+		int i_index = 0, j_index = 0;
+		char temp[10], result[5];
 		while(uxQueueMessagesWaiting(Q_KeyboardInput) != pdFALSE)
 		{
-			printf("some queue message\n");
-			for ( int sum = 0;
-					xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY) == pdFALSE;
-					++index)
+			xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY);
+			int numb = 0;
+			switch (key_q)
 			{
-				temp[index%10]=key_q;
+				case 0x16: 	{ numb = 1; break;}
+				case 0x1e:  { numb = 2; break;}
+				case 0x26:  { numb = 3; break;}
+				case 0x25:  { numb = 4; break;}
+				case 0x2e:  { numb = 5; break;}
+				case 0x36:  { numb = 6; break;}
+				case 0x3d:  { numb = 7; break;}
+				case 0x3e:  { numb = 8; break;}
+				case 0x46:  { numb = 9; break;}
+				case 0x45:  { numb = 0; break;}
+			}
+			temp[i_index]= numb;
+			++i_index;
+		}
+
+		for( int i=0,j=0; i<i_index;++i)
+		{
+			if(i%2 == 0)
+			{
+				result[j] = temp[i];
+				j_index = ++j;
 			}
 		}
-		for( int i=0; i<index;++i){
-			printf("temp[%d]=%d ",i,temp[i]);
+		//take every two element from array
+		int threshold = 0;
+		for( int  i = 0 , j = j_index ; i < j_index, j > 0; ++i , --j )
+		{
+			printf("result[%d]=%d ",i,result[i]);
+			threshold += result[i]*pow(10,j);
 		}
-//		xSemaphoreGive(SharedSource_KB_update);
-//		printf("\t give sem\n");
+//		printf("threshold=%f",(double)(threshold/10));
+		//prepare LCD for display threshold
+		FILE* fp;
+		fp = fopen(CHARACTER_LCD_NAME, "w"); //open the character LCD as a file stream for write
+
+		if (fp == NULL) {
+			printf("open failed\n");
+		}
+		if (setFreqOrRoc == 'r')
+		{
+			Threshold_RoC = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/100.0) ;
+			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
+			printf("ROC=%f",Threshold_RoC);
+		}
+		else if(setFreqOrRoc == 'f')
+		{
+			Threshold_Freq = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/100.0) ;
+			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
+			printf("Freq=%f",Threshold_Freq);
+		}
+		else
+		{
+			printf("\n##ENTER r for ROC, f for Frequency\n");
+		}
+		setFreqOrRoc = 'N';
+		fclose(fp);
+		++updateCounter;
+		Threshold_dec = false;
+//		printf("updateCounter = %d\n",updateCounter);
 	}
 //	vTaskDelay(5000);
 	return;
@@ -515,7 +571,9 @@ int main()
 void initSystem()
 {
 	/*Start with Five loads, indicate by RED LEDs*/
-//		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE,0);
+		FILE* lcd = fopen(CHARACTER_LCD_BASE,'w');
+		fprintf(lcd,"%c%s Maintenance\n",esc,"[2J");
+		fclose(lcd);
 		uiLoadBank = redMask;
 		if(CurSysMode != MAINTAIN)
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiLoadBank);
