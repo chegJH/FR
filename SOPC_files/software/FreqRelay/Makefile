@@ -142,9 +142,17 @@ ACDS_VERSION := 17.1
 ELF := FreqRelay.elf
 
 # Paths to C, C++, and assembly source files.
-C_SRCS := main.c
+C_SRCS += main.c
+C_SRCS += FreeRTOS/croutine.c
+C_SRCS += FreeRTOS/event_groups.c
+C_SRCS += FreeRTOS/heap.c
+C_SRCS += FreeRTOS/list.c
+C_SRCS += FreeRTOS/port.c
+C_SRCS += FreeRTOS/queue.c
+C_SRCS += FreeRTOS/tasks.c
+C_SRCS += FreeRTOS/timers.c
 CXX_SRCS :=
-ASM_SRCS :=
+ASM_SRCS := FreeRTOS/port_asm.S
 
 
 # Path to root of object file tree.
