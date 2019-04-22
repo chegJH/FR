@@ -29,12 +29,11 @@
 
 /*Task Priorities:*/
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
-#define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
-#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+5)
-#define LoadManager_Task_P 		(tskIDLE_PRIORITY+4)
-#define UpdateThresholds_P		(tskIDLE_PRIORITY+5)
+#define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+4)
+#define UpdateLED_Task_P 		(tskIDLE_PRIORITY+6)
+#define LoadManager_Task_P 		(tskIDLE_PRIORITY+5)
+#define UpdateThresholds_P		(tskIDLE_PRIORITY+3)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+4)
-#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+1)
 
 
 /*Functions*/
@@ -100,7 +99,7 @@ bool Threshold_dec = false;
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
-SystemCondition CurSysCond = STABLE;//1 for STABLE;
+SystemCondition CurSysCond = UNDEFINED_SysCon;//1 for STABLE;
 SystemMode CurSysMode = RUN;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
@@ -109,6 +108,7 @@ int keyInputSum = 0;
 /*Timer*/
 TimerHandle_t xTimer_LoadShed;
 TimerHandle_t xTimer_SameSysCond; //used in same system condition occurs
+void timerCallBack_sameSysCond(TimerHandle_t);
 /*For Threshold setting,
  * setFreqOrRoc = r/R for setting RoC threshold
  * setFreqOrRoc = f/F for setting Frequency threshold
@@ -118,8 +118,8 @@ char setFreqOrRoc = 'N';
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
-TickType_t xTimer1 ; //stores the time cost of load dropping..
-TickType_t xTimer2;
+TickType_t xTimer_drop_init; //stores the time cost of load dropping..
+TickType_t xTimer_drop_Done;
 unsigned int DropCounter = 0;
 
 /*PreSysCon,
@@ -150,7 +150,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 	// need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-	xSemaphoreTakeFromISR(SharedSource_LCD_show,pdFALSE);
+	xSemaphoreTakeFromISR(SharedSource_LCD_show,portMax_DELAY);
 	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	switch(CurSysMode)
 	{
@@ -159,7 +159,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  CurSysMode= RUN;
           printf("\nQ_FreqInfo:\t");
           xQueueReset(Q_FreqInfo);
-          printf(" reset\n")
+          printf(" reset\n");
           printf("freq_analyser:");
           vTaskResume(xHandle_freqAnalazer);
           printf("\tresumed\n");
@@ -182,9 +182,9 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  fprintf(lcd, "%c%s %s",esc,"[2J","Maintenance\nEnter r or f\n");
 		  fclose(lcd);
 		  alt_irq_enable(PS2_IRQ);
-		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+		  xSemaphoreGiveFromISR(SharedSource_KB_update,DELAY_updateThreshold);
 		  printf("SEM given in pushbtn fn\n");
-		  xSemaphoreGiveFromISR(SharedSource_LCD_show,pdFALSE);
+		  xSemaphoreGiveFromISR(SharedSource_LCD_show,portMax_DELAY);
 		  break;
 	  }
 	}
@@ -264,13 +264,13 @@ void freq_relay(void *pvParameters)
 {
 	FreqInfo freqData = {
 			(double)16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0),
-			xTaskGetTickCountFromISR()/1000
+			xTaskGetTickCountFromISR()/1000.0
 	};
 //	printf("freeq_value = %f\t time=%d\n",freqData.freq_value, freqData.record_time);
 
 	if (CurSysMode == RUN)
 	{
-		xQueueSendToFrontFromISR( Q_FreqInfo, &freqData, pdFALSE );
+		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData, pdFALSE );
         xSemaphoreGiveFromISR(xSemaphore_Freq_analyzer,FreqAnalyser_Task_P);
 	}else if(CurSysMode == MAINTAIN)
@@ -334,7 +334,6 @@ void updateThreshold(void *pvParameters)
 			printf("result[%d]=%d ",i,result[i]);
 			threshold += result[i]*pow(10,j);
 		}
-//		printf("threshold=%f",(double)(threshold/10));
 		//prepare LCD for display threshold
 		xSemaphoreTake(SharedSource_LCD_show,pdFALSE);
 		FILE* fp;
@@ -383,7 +382,7 @@ void freq_analyser(void *pvParameters)
 	double RoC = 0;
 	int FreqHyIndex = 0;
 	bool isFirstLoadDrop = true;
-    SystemCondition prevSysCond = UNDEFINED_SysCon;
+    TickType_t clock = xTaskGetTickCount();
 	/* read from queue
 	 * First check the current reading, if it's lower than threshold, call load ctr
 	 * If the available data is more than 2, calculate RoC
@@ -393,48 +392,31 @@ void freq_analyser(void *pvParameters)
 		xSemaphoreTake(xSemaphore_Freq_analyzer,portMax_DELAY);
 		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
 		{
-//			printf("Readout from Q_FreqInfo\n \tFreq value:%f Time: %d\n",curFreq.freq_value, curFreq.record_time );
+			printf("Readout from Q_FreqInfo\n \tFreq value:%f Time: %d\n",curFreq.freq_value, curFreq.record_time );
 			if(curFreq.record_time == 0){//for first reading
 				preFreq = curFreq;
 			}
 			RoC = (double)abs(curFreq.freq_value - preFreq.freq_value)/abs((double)curFreq.record_time - (double)preFreq.record_time);
 		}
-		/*Store freq to history data storage*/
+	/*Store freq to history data storage*/
 		historyFreq[FreqHyIndex%MaxRecordNum] = curFreq;
 		if (FreqHyIndex != 5){
 			++FreqHyIndex;
 		}else{
 			FreqHyIndex = 0;//reset the history storage index
 		}
-        /* Determin the system stability with threshold*/
+	/* Determin the system stability with threshold*/
 		if(curFreq.freq_value < Threshold_Freq || RoC > Threshold_RoC)  //UNSTABLE;
 		{
 			CurSysCond = UNSTABLE;
+			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
 		}else{                                                          //STABLE
 			CurSysCond = STABLE;
-//			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
+			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
 		}
-        xQueueSendToBackFromISR(Q_LoadOperation,&CurSysCond, pdFALSE);//Send expected Load operation
-        //Does the system stability stays same  as prevous 
-        if ( CurSysCond == prevSysCond){                            //same System condition
-            xTimerStart(xTimer_SameSysCond,portMax_Delay);
-        }else{                                                      //new system condition
-            prevSysCond = CurSysCond;
-            if (isFirstLoadDrop){ //drop first load fast
-                xSemaphoreGive(xSemaphore_Load_manager);
-                xTimer1 = xTaskGetTickCount();
-                isFirstLoadDrop = false;
-            }
-            if (xTimerIsActive(xTimer_SameSysCond){
-                printf("\nNewSysCon Occur, stop timer and call manager\n");
-                xTimerReset(xTimer_SameSysCond,portMax_Delay);
-            }
-            //call manager to drop a load
-			xSemaphoreGive(xSemaphore_Load_manager);
-        }
+		xQueueSendToBackFromISR(Q_LoadOperation,&CurSysCond, pdFALSE);//Send expected Load operation
+		xSemaphoreGive(xSemaphore_Load_manager);
 	}
-	return;
-
 }
 /* Load manager
  * Control the load operation,
@@ -443,7 +425,8 @@ void freq_analyser(void *pvParameters)
  */
 void load_manager(void *pvParameters)
 {
-	SystemCondition sysCon = UNDEFINED_SysCon;
+	SystemCondition sysCon = UNDEFINED_SysCon,preSysCon = UNDEFINED_SysCon;
+	bool isFirstDrop = true;
 	while(1)
 	{
         xSemaphoreTake(xSemaphore_Load_manager,portMax_DELAY);
@@ -451,32 +434,46 @@ void load_manager(void *pvParameters)
 		{
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 			{
-	//			printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d DropCounter=%d freqThreshold=%d\n",sysCon,uiLoadBank,uiManageTime,DropCounter,Threshold_Freq);
+				printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d DropCounter=%d freqThreshold=%f\n",sysCon,uiLoadBank,uiManageTime,DropCounter,Threshold_Freq);
 				switch(sysCon)
 				{
-					case UNSTABLE: 
+					case UNSTABLE:
                     {
                         if (uiLoadBank != 0) //if any load is present
                         {
                             /* The load is not dropped until update_led process it */
                             uiLoadBank -= (unsigned int)pow(2,DropCounter);
+                            if (isFirstDrop){
+                            	xTimer_drop_init = xTaskGetTickCount();
+                            }
                             ++DropCounter;
-//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, DropCounter=%d ##\n",uiLoadBank,DropCounter);
-						}
-                            // uiManageTime = xTaskGetTickCount();
+							printf("\n##UNSTABLE-->dropLoad, uiLoadBank=%d, DropCounter=%d ##\n",uiLoadBank,DropCounter);
+							xSemaphoreGive(xSemaphore_LED_updater);
+							uiManageTime = xTaskGetTickCount();
+						}else{
+							if (xTaskGetTickCount() - 500 > uiManageTime){
+								if ( uiLoadBank != 0){
+									uiLoadBank -= pow(2,DropCounter);
+									++DropCounter;
+								}uiManageTime = xTaskGetTickCount();
+							}xSemaphoreGive(xSemaphore_LED_updater);
+						}preSysCon = sysCon;
 						break;
 					}
-					case STABLE: 
+					case STABLE:
                     {
-						
+
 							/*Start put loads back on */
-							// uiManageTime = xTaskGetTickCount();	//Restart timer
+							 uiManageTime = xTaskGetTickCount();	//Restart timer
                         if (uiLoadBank != redMask) //if not all load present
                         {
-                            --DropCounter;
-                            uiLoadBank += pow(2,DropCounter);//Add loads
-                            //printf("\n##STABLE-->Add loads, uiLoadBank=%d,DropCounter=%d ##\n",uiLoadBank,DropCounter);
-                        }
+                        	if(xTaskGetTickCount() - 500 > uiManageTime){
+                        		--DropCounter;
+                        		uiLoadBank += pow(2,DropCounter);//Add loads
+                        		printf("\n##STABLE-->Add loads, uiLoadBank=%d,DropCounter=%d ##\n",uiLoadBank,DropCounter);
+                        	}uiManageTime = xTaskGetTickCount();
+                        }preSysCon = sysCon;
+                        xSemaphoreGive(xSemaphore_LED_updater);
 						break;
 					}
 
@@ -485,7 +482,7 @@ void load_manager(void *pvParameters)
 						break;
 					}
 				}
-                xSemaphoreGive(xSemaphore_LED_updater);
+//                xSemaphoreGive(xSemaphore_LED_updater);
                 xSemaphoreGive(xSemaphore_Freq_analyzer);
 			}
 		}else{
@@ -501,7 +498,6 @@ void load_manager(void *pvParameters)
 void update_LED(void *pvParameters)
 {
 	bool isFirstUpdate = true;
-	printf("update LED\n");
 	unsigned int uiSwitchValue;
 	unsigned int uiRedLED;
 	unsigned int uiGreenLED;
@@ -509,21 +505,24 @@ void update_LED(void *pvParameters)
 	while(1)
 	{
 		xSemaphoreTake(xSemaphore_LED_updater,portMax_DELAY);
+		printf("update LED\n");
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
 			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
 		if( CurSysMode == RUN){
 			uiRedLED = uiSwitchValue & uiLoadBank;
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
-			if(CurSysCond == 1)
+			if(CurSysCond == STABLE)
 			{
+				printf("STABLE:switch control enabled\n");
 				//For Most 5 right
 				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
 				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 			}else{
+				printf("UNSTABLE:switch control disabled\n");
 				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-				if (isFirstUpdate && xTimer1 != 0){
-					xTimer2 = xTaskGetTickCount();
-					printf("First Load Drop Cost:%d ms\n",(int)(xTimer2 - xTimer1));
+				if (isFirstUpdate && xTimer_drop_init != 0){
+					xTimer_drop_Done = xTaskGetTickCount() - xTimer_drop_init;
+					printf("First Load Drop Cost:%d ms\n",(int)xTimer_drop_Done);
 					isFirstUpdate = false;
 				}
 				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
@@ -570,7 +569,7 @@ void initSystem()
 {
 	/*Start with Five loads, indicate by RED LEDs*/
 		FILE* lcd = fopen(CHARACTER_LCD_BASE,'w');
-		fprintf(lcd,"%c%s Maintenance\n",esc,"[2J");
+		fprintf(lcd,"%c%s %s\n",esc,"[2J","Maintenance");
 		fclose(lcd);
 		uiLoadBank = redMask;
 		if(CurSysMode != MAINTAIN)
@@ -615,7 +614,7 @@ static void initKeyBDISR()
 		alt_irq_register(PS2_IRQ, ps2_device, ps2_isr); //only enabled in maintain mode
 		(CurSysMode == MAINTAIN)? alt_irq_enable(PS2_IRQ) : alt_irq_disable(PS2_IRQ);
 		IOWR_8DIRECT(PS2_BASE,4,1);
-		printf("Enable ps2_irq\n");
+		printf("initKeyBDISR\n");
 		return;
 }
 
@@ -627,7 +626,13 @@ void initSharedResources()
     xSemaphore_Freq_analyzer =xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
     xSemaphore_LED_updater =xSemaphoreCreateCounting(3,uxInitialCount);
 //    xTimer_LoadShed = xTimerCreate("ManagerTimer",1000,pdFALSE,0,tmr_dropLoad);
-    xTimer_SameSysCond = xTimerCreate("SameSysCon_Timer",500,pdFALSE,0,timerCallBack_sameSysCond);
+    xTimer_SameSysCond = xTimerCreate(
+    		"SameSysCon_Timer",
+			100,
+			pdFALSE,
+			0,
+			timerCallBack_sameSysCond
+			);
 	return;
 }
 void initTask()
@@ -675,8 +680,9 @@ void initTask()
  * after time up, check CurSysCond, if it is same as the sysCond timer start
  * add/drop a load
  */
-void timerCallBack_sameSysCond()
+void timerCallBack_sameSysCond(TimerHandle_t xTimer_SameSysCond)
 {
-    printf("timerCallBack,times up\n")
+    printf("timerCallBack,times up\n");
     xSemaphoreGive(xSemaphore_Load_manager);
+//    return xTimer_SameSysCond;
 }
