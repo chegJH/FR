@@ -88,7 +88,9 @@ FreqInfo historyFreq[MaxRecordNum];
 /*Semaphore*/
 SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update procedure.
 SemaphoreHandle_t SharedSource_LCD_show; //use to gard lcd usage.
-
+SemaphoreHandle_t SharedSource_Load_manager; // use with load manager
+UBaseType_t uxMaxCount_loadMan=100;
+UBaseType_t uxInitialCount=0;
 /*Threshold*/
 double Threshold_Freq = 50;
 double Threshold_RoC = 5;
@@ -255,6 +257,7 @@ void freq_relay(void *pvParameters)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
+        xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
 	}
 	usleep(5000);
 	return;
@@ -406,6 +409,7 @@ void load_manager(void *pvParameters)
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
+        xSemaphoreTake(SharedSource_Load_manager);
 		if(CurSysMode == RUN)
 		{
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
@@ -633,6 +637,7 @@ void initSharedResources()
 {
 	vSemaphoreCreateBinary(SharedSource_KB_update);
 	vSemaphoreCreateBinary(SharedSource_LCD_show);
+    xSemaphoreCreateCounting(uxMaxCount_loadMan,uxInitialCount);
 	return;
 }
 void initTask()
