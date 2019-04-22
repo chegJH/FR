@@ -30,8 +30,8 @@
 /*Task Priorities:*/
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
-#define LoadManager_Task_P 		(tskIDLE_PRIORITY+5)
 #define UpdateLED_Task_P 		(tskIDLE_PRIORITY+5)
+#define LoadManager_Task_P 		(tskIDLE_PRIORITY+4)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+5)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+4)
 #define SystemChecker_Task_P 	(tskIDLE_PRIORITY+1)
@@ -106,6 +106,9 @@ char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
 
+/*Timer*/
+TimerHandle_t xTimer_LoadShed;
+//TimerHandle_t xTimer_
 /*For Threshold setting,
  * setFreqOrRoc = r/R for setting RoC threshold
  * setFreqOrRoc = f/F for setting Frequency threshold
@@ -115,7 +118,8 @@ char setFreqOrRoc = 'N';
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
-unsigned int uiDropLoadTime = 0; //stores the time cost of load dropping. in sec.
+TickType_t xTimer1 ; //stores the time cost of load dropping..
+TickType_t xTimer2;
 unsigned int dropCounter = 0;
 
 /*PreSysCon,
@@ -368,7 +372,7 @@ void freq_analyser(void *pvParameters)
 	printf("freq_analyser\n");
 	double RoC = 0;
 	int FreqHyIndex = 0;
-
+	bool isFirstLoadDrop = true;
 	/* read from queue
 	 * First check the current reading, if it's lower than threshold, call load ctr
 	 * If the available data is more than 2, calculate RoC
@@ -396,6 +400,11 @@ void freq_analyser(void *pvParameters)
 			currentSysStability = UNSTABLE;//UNSTABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
+//			if (isFirstLoadDrop && curFreq.record_time > 0){
+//				xTimer1 = xTaskGetTickCount();
+//				isFirstLoadDrop = false;
+//				printf("\nxTimer1 = %d\n",(int)xTimer1);
+//			}
 			xSemaphoreGive(xSemaphore_Load_manager);
 		}else{
 			currentSysStability = STABLE;//STABLE;
@@ -415,7 +424,6 @@ void freq_analyser(void *pvParameters)
 void load_manager(void *pvParameters)
 {
 	bool isFirstLoadDrop = true;
-
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
@@ -435,7 +443,7 @@ void load_manager(void *pvParameters)
 								/*Drop very first load, the load is not dropped until update_led process it */
 								uiLoadBank -= (unsigned int)pow(2,dropCounter);
 								if (isFirstLoadDrop){
-									uiDropLoadTime = xTaskGetTickCount();
+									xTimer1 = xTaskGetTickCount();
 									isFirstLoadDrop = false;
 								}
 								++dropCounter;
@@ -519,9 +527,9 @@ void update_LED(void *pvParameters)
 				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 			}else{
 				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-				if (isFirstUpdate){
-					uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime);
-					printf("\nFirst load dropped in %d ms\n",uiDropLoadTime);
+				if (isFirstUpdate && xTimer1 != 0){
+					xTimer2 = xTaskGetTickCount();
+					printf("First Load Drop Cost:%d ms\n",(int)(xTimer2 - xTimer1));
 					isFirstUpdate = false;
 				}
 				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
@@ -660,6 +668,7 @@ void initSharedResources()
     xSemaphore_Load_manager = xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
     xSemaphore_Freq_analyzer =xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
     xSemaphore_LED_updater =xSemaphoreCreateCounting(3,uxInitialCount);
+//    xTimer_LoadShed = xTimerCreate("ManagerTimer",1000,pdFALSE,0,tmr_dropLoad);
 	return;
 }
 void initTask()
