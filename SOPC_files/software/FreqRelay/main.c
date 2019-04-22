@@ -60,6 +60,13 @@ typedef enum{ MAINTAIN=0, RUN=1, UNDEFINED =2} SystemMode;
 typedef enum{UNSTABLE=0,STABLE=1,UNDEFINED_SysCon =2} SystemCondition;
 const unsigned int NumLoads=5;
 unsigned int redMask = 0x1F;
+unsigned int redMask_4 = 0x10;
+unsigned int redMask_3 = 0x8;
+unsigned int redMask_2 = 0x4;
+unsigned int redMask_1 = 0x2;
+unsigned int redMask_0 = 0x1;
+unsigned int Mask[5] ;//= [redMask_4,redMask_3,redMask_2,redMask_1,redMask_0]
+
 static unsigned char esc = 0x1b;
 
 /*DataType*/
@@ -105,6 +112,7 @@ SystemMode CurSysMode = RUN;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
+bool LoadChangeInMaintain = false;
 
 /*Timer*/
 TimerHandle_t xTimer_LoadShed;
@@ -425,29 +433,50 @@ void load_manager(void *pvParameters)
 {
 	bool isFirstLoadDrop = true;
 	SystemCondition sysCon = UNDEFINED_SysCon;
+	unsigned int bitToChange = 0;
 	while(1)
 	{
         xSemaphoreTake(xSemaphore_Load_manager,portMax_DELAY);
 		if(CurSysMode == RUN)
 		{
+			//scan load bank, find out off loads
+			unsigned int offBits = uiLoadBank ^ redMask;
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 			{
-	//			printf("Load_manager: sysCon:%d Loadbank=%d\t uiManageTime=%d dropCounter=%d freqThreshold=%d\n",sysCon,uiLoadBank,uiManageTime,dropCounter,Threshold_Freq);
 				switch(sysCon)
 				{
-					case UNSTABLE: {
+					case UNSTABLE:
+					{
 						if (sysCon != PreSysCon)
 						{
 							if (uiLoadBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 							{
 								/*Drop very first load, the load is not dropped until update_led process it */
-								uiLoadBank -= (unsigned int)pow(2,dropCounter);
-								if (isFirstLoadDrop){
-									xTimer1 = xTaskGetTickCount();
-									isFirstLoadDrop = false;
+								bitToChange = pow(2,dropCounter);
+								printf("bitTochange= %d",bitToChange);
+								if (LoadChangeInMaintain == true)
+								{
+									printf("loadChangeinMaintain\t");
+									if ((bitToChange & offBits) == 0){
+										uiLoadBank -= bitToChange;
+										++dropCounter;
+										printf("\change made - loadband=%d\n",uiLoadBank);
+										if (isFirstLoadDrop)
+										{
+											xTimer1 = xTaskGetTickCount();
+											isFirstLoadDrop = false;
+//											printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
+										}
+									}else{
+										printf("bit already off\n");
+									}
 								}
-								++dropCounter;
-	//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
+								else
+								{
+									printf("direct change\n");
+									uiLoadBank -= bitToChange;
+									++dropCounter;
+								}
 								xSemaphoreGive(xSemaphore_LED_updater);							}
 							uiManageTime = xTaskGetTickCount();
 						}else{
@@ -455,9 +484,14 @@ void load_manager(void *pvParameters)
 							{
 								/*Drop loads after first load is dropped, 500ms waiting applies*/
 								if (uiLoadBank != 0){
-									uiLoadBank -= pow(2,dropCounter);
+									bitToChange = pow(2,dropCounter);
+									if ((bitToChange & offBits) == 0){
+										uiLoadBank -= bitToChange;
+										printf("\ndropLoad, uiLoadBank=%d, dropCounter=%d\n",uiLoadBank,dropCounter);
+									}else{
+										printf("bit already off\n");
+									}
 									++dropCounter;
-	//								printf("\n##UNSTABLE-->dropLoad, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
 								uiManageTime = xTaskGetTickCount();
 							}
@@ -466,20 +500,40 @@ void load_manager(void *pvParameters)
 						PreSysCon = sysCon;
 						break;
 					}
-					case STABLE: {
+					case STABLE:
+					{
 						if (sysCon != PreSysCon)
 						{
 							/*Start put loads back on */
 							uiManageTime = xTaskGetTickCount();	//Restart timer
-						}else{
+						}
+						else
+						{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
 	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != redMask)
 								{
-									--dropCounter;
-									uiLoadBank += pow(2,dropCounter);//Add loads
-//									printf("\n##STABLE-->Add loads, uiLoadBank=%d,dropCounter=%d ##\n",uiLoadBank,dropCounter);
+									if (LoadChangeInMaintain == true)
+									{
+										printf("loadChangeinMaintain\t");
+										--dropCounter;
+										bitToChange = pow(2,dropCounter);
+										if ((bitToChange & offBits) == 0)
+										{
+											uiLoadBank += bitToChange;//Add loads
+											printf("\nAdd loads, uiLoadBank=%d,dropCounter=%d \n",uiLoadBank,dropCounter);
+										}else{
+											printf("bit already on\n");
+										}
+									}
+									else
+									{
+										printf("direct change\n");
+										--dropCounter;
+										bitToChange = pow(2,dropCounter);
+										uiLoadBank += bitToChange;//Add loads
+									}
 								}
 	//							xSemaphoreGive(shareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
@@ -516,9 +570,9 @@ void update_LED(void *pvParameters)
 	{
 		xSemaphoreTake(xSemaphore_LED_updater,portMax_DELAY);
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
-			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE) & redMask;
 		if( CurSysMode == RUN){
-			uiRedLED = uiSwitchValue & uiLoadBank;
+			uiRedLED = uiSwitchValue & uiLoadBank & redMask;
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
 			if(currentSysStability == 1)
 			{
@@ -538,13 +592,10 @@ void update_LED(void *pvParameters)
 			/*In Maintenance mode, Loads are controlled by switches no matter what in the uiLoadBank at the moment
 			 * Update the uiLoadBank after control*/
 			uiRedLED = uiSwitchValue & redMask;
-			unsigned int diff = uiLoadBank ^ uiSwitchValue;
+//			unsigned int diff = uiLoadBank ^ uiSwitchValue;
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
 			uiLoadBank = uiRedLED & redMask;
-			int itr = 0;
-			for(itr = 0; diff != 0x1; diff = diff >> 1,++itr);
-			dropCounter = itr;
-			printf("\ndropCounter  = %d\n",dropCounter);
+			LoadChangeInMaintain = true;
 		}
 	}
 			printf("update_LED,system unstable");
