@@ -88,8 +88,10 @@ FreqInfo historyFreq[MaxRecordNum];
 /*Semaphore*/
 SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update procedure.
 SemaphoreHandle_t SharedSource_LCD_show; //use to gard lcd usage.
-SemaphoreHandle_t SharedSource_Load_manager; // use with load manager
-UBaseType_t uxMaxCount_loadMan=100;
+SemaphoreHandle_t xSemaphore_Freq_analyzer;
+SemaphoreHandle_t xSemaphore_Load_manager; // use with load manager
+SemaphoreHandle_t xSemaphore_LED_updater;
+UBaseType_t uxMaxCount_sem=50;
 UBaseType_t uxInitialCount=0;
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -257,9 +259,14 @@ void freq_relay(void *pvParameters)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
-        xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
+        xSemaphoreGiveFromISR(xSemaphore_Freq_analyzer,FreqAnalyser_Task_P);
+	}else if(CurSysMode == MAINTAIN)
+	{
+		/* In maintain mode, the frequency info is only send to queue for VGA display*/
+		//TODO: send freq and time for plot
+		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
 	}
-	usleep(5000);
+//	usleep(5000);
 	return;
 }
 
@@ -368,6 +375,7 @@ void freq_analyser(void *pvParameters)
 	 */
 	while (1)
 	{
+		xSemaphoreTake(xSemaphore_Freq_analyzer,portMax_DELAY);
 		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
 		{
 //			printf("Readout from Q_FreqInfo\n \tFreq value:%f Time: %d\n",curFreq.freq_value, curFreq.record_time );
@@ -388,10 +396,12 @@ void freq_analyser(void *pvParameters)
 			currentSysStability = UNSTABLE;//UNSTABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
+			xSemaphoreGive(xSemaphore_Load_manager);
 		}else{
 			currentSysStability = STABLE;//STABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
+			xSemaphoreGive(xSemaphore_Load_manager);
 		}
 	}
 	return;
@@ -409,7 +419,7 @@ void load_manager(void *pvParameters)
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
-        xSemaphoreTake(SharedSource_Load_manager);
+        xSemaphoreTake(xSemaphore_Load_manager,portMax_DELAY);
 		if(CurSysMode == RUN)
 		{
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
@@ -418,13 +428,11 @@ void load_manager(void *pvParameters)
 				switch(sysCon)
 				{
 					case UNSTABLE: {
-	//					printf("sysCon=UNSTABLE\n");
 						if (sysCon != PreSysCon)
 						{
 							if (uiLoadBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 							{
 								/*Drop very first load, the load is not dropped until update_led process it */
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								uiLoadBank -= (unsigned int)pow(2,dropCounter);
 								if (isFirstLoadDrop){
 									uiDropLoadTime = xTaskGetTickCount();
@@ -432,29 +440,25 @@ void load_manager(void *pvParameters)
 								}
 								++dropCounter;
 	//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
-	//							xSemaphoreGive(shareSource_LED_sem);
-							}
+								xSemaphoreGive(xSemaphore_LED_updater);							}
 							uiManageTime = xTaskGetTickCount();
 						}else{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
 								/*Drop loads after first load is dropped, 500ms waiting applies*/
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != 0){
 									uiLoadBank -= pow(2,dropCounter);
 									++dropCounter;
 	//								printf("\n##UNSTABLE-->dropLoad, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
-	//							xSemaphoreGive(shareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
 							}
-
+							xSemaphoreGive(xSemaphore_LED_updater);
 						}
 						PreSysCon = sysCon;
 						break;
 					}
 					case STABLE: {
-	//					printf("sysCon=STABLE\n");
 						if (sysCon != PreSysCon)
 						{
 							/*Start put loads back on */
@@ -474,6 +478,7 @@ void load_manager(void *pvParameters)
 							}
 						}
 						PreSysCon = sysCon;
+						xSemaphoreGive(xSemaphore_LED_updater);
 						break;
 					}
 
@@ -501,22 +506,37 @@ void update_LED(void *pvParameters)
 	/*indicate load condition with LEDs*/
 	while(1)
 	{
+		xSemaphoreTake(xSemaphore_LED_updater,portMax_DELAY);
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
-//			xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+		if( CurSysMode == RUN){
 			uiRedLED = uiSwitchValue & uiLoadBank;
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
-		if(currentSysStability == 1)
-		{
-			//For Most 5 right
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
-		}else{
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-			if (isFirstUpdate){
-				uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime)/1000;
+			if(currentSysStability == 1)
+			{
+				//For Most 5 right
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
+				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
+			}else{
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
+				if (isFirstUpdate){
+					uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime);
+					printf("\nFirst load dropped in %d ms\n",uiDropLoadTime);
+					isFirstUpdate = false;
+				}
+				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 			}
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
+		}else{
+			/*In Maintenance mode, Loads are controlled by switches no matter what in the uiLoadBank at the moment
+			 * Update the uiLoadBank after control*/
+			uiRedLED = uiSwitchValue & redMask;
+			unsigned int diff = uiLoadBank ^ uiSwitchValue;
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
+			uiLoadBank = uiRedLED & redMask;
+			int itr = 0;
+			for(itr = 0; diff != 0x1; diff = diff >> 1,++itr);
+			dropCounter = itr;
+			printf("\ndropCounter  = %d\n",dropCounter);
 		}
 	}
 			printf("update_LED,system unstable");
@@ -637,7 +657,9 @@ void initSharedResources()
 {
 	vSemaphoreCreateBinary(SharedSource_KB_update);
 	vSemaphoreCreateBinary(SharedSource_LCD_show);
-    xSemaphoreCreateCounting(uxMaxCount_loadMan,uxInitialCount);
+    xSemaphore_Load_manager = xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
+    xSemaphore_Freq_analyzer =xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
+    xSemaphore_LED_updater =xSemaphoreCreateCounting(3,uxInitialCount);
 	return;
 }
 void initTask()
