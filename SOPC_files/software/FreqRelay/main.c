@@ -98,6 +98,8 @@ SemaphoreHandle_t SharedSource_LCD_show; //use to gard lcd usage.
 SemaphoreHandle_t xSemaphore_Freq_analyzer;
 SemaphoreHandle_t xSemaphore_Load_manager; // use with load manager
 SemaphoreHandle_t xSemaphore_LED_updater;
+SemaphoreHandle_t SharedSource_loadbank;
+
 UBaseType_t uxMaxCount_sem=50;
 UBaseType_t uxInitialCount=0;
 /*Threshold*/
@@ -424,6 +426,27 @@ void freq_analyser(void *pvParameters)
 	return;
 
 }
+/*In order to add/drop next load, find out the bit position*/
+unsigned int findBitPosition(void)
+{
+	unsigned int bitMask = 0x1;
+	unsigned int itr;
+	unsigned int tmpLoad = uiLoadBank;
+	//find the most right bit
+	for(itr = 0; (tmpLoad & bitMask) == 1;++itr)
+	{
+		if (tmpLoad == 1){
+			printf("tmpLoad = 1\n");
+			return itr;
+		}else{
+			printf("findBitPosition, itr=%d,bitMask=%d,tmpLoad=%d\n",itr,bitMask,tmpLoad);
+			tmpLoad = (tmpLoad >> 1) & redMask;
+			return itr;
+		}
+	}
+	printf("\t the Position found as:%d\n",itr);
+	return itr;
+}
 /* Load manager
  * Control the load operation,
  * Read from Q_LoadOperation
@@ -434,113 +457,98 @@ void load_manager(void *pvParameters)
 	bool isFirstLoadDrop = true;
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	unsigned int bitToChange = 0;
+	unsigned int change = 0;//pow(2,bitToChange);
+	unsigned int allLoad;
+
 	while(1)
 	{
         xSemaphoreTake(xSemaphore_Load_manager,portMax_DELAY);
+        bitToChange = findBitPosition();
+        allLoad = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE) & redMask;
 		if(CurSysMode == RUN)
 		{
 			//scan load bank, find out off loads
-			unsigned int offBits = uiLoadBank ^ redMask;
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
 			{
 				switch(sysCon)
 				{
 					case UNSTABLE:
 					{
+						change = pow(2,bitToChange);
 						if (sysCon != PreSysCon)
 						{
-							if (uiLoadBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
+							if (uiLoadBank != allLoad)//check if all loads are present - If so,shed the first load(lowest priority)
 							{
-								/*Drop very first load, the load is not dropped until update_led process it */
-								bitToChange = pow(2,dropCounter);
-								printf("bitTochange= %d",bitToChange);
-								if (LoadChangeInMaintain == true)
+								uiLoadBank -= change;
+								printf("\nDROP\n");
+								uiManageTime = xTaskGetTickCount();
+								xSemaphoreGive(xSemaphore_LED_updater);
+								if (isFirstLoadDrop)
 								{
-									printf("loadChangeinMaintain\t");
-									if ((bitToChange & offBits) == 0){
-										uiLoadBank -= bitToChange;
-										++dropCounter;
-										printf("\change made - loadband=%d\n",uiLoadBank);
-										if (isFirstLoadDrop)
-										{
-											xTimer1 = xTaskGetTickCount();
-											isFirstLoadDrop = false;
-//											printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
-										}
-									}else{
-										printf("bit already off\n");
-									}
+									xTimer1 = xTaskGetTickCount();
+									isFirstLoadDrop = false;
 								}
-								else
-								{
-									printf("direct change\n");
-									uiLoadBank -= bitToChange;
-									++dropCounter;
-								}
-								xSemaphoreGive(xSemaphore_LED_updater);							}
-							uiManageTime = xTaskGetTickCount();
-						}else{
+							}
+							else
+							{
+								printf("all load dropped\n");
+							}
+						}
+						else
+						{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
 								/*Drop loads after first load is dropped, 500ms waiting applies*/
-								if (uiLoadBank != 0){
-									bitToChange = pow(2,dropCounter);
-									if ((bitToChange & offBits) == 0){
-										uiLoadBank -= bitToChange;
-										printf("\ndropLoad, uiLoadBank=%d, dropCounter=%d\n",uiLoadBank,dropCounter);
-									}else{
-										printf("bit already off\n");
-									}
-									++dropCounter;
+								if (uiLoadBank != 0)
+								{
+									uiLoadBank -= bitToChange;
+									printf("\nDROP\n");
+									xSemaphoreGive(xSemaphore_LED_updater);
+								}
+								else
+								{
+									printf("all load dropped\n");
 								}
 								uiManageTime = xTaskGetTickCount();
 							}
-							xSemaphoreGive(xSemaphore_LED_updater);
 						}
 						PreSysCon = sysCon;
 						break;
 					}
 					case STABLE:
 					{
+						if (bitToChange == 0){
+							change = 1 ;
+						}else{
+							change = pow(2,--bitToChange);
+						}
 						if (sysCon != PreSysCon)
 						{
 							/*Start put loads back on */
 							uiManageTime = xTaskGetTickCount();	//Restart timer
+							uiLoadBank+=change;
+							printf("\nADD\n");
+							xSemaphoreGive(xSemaphore_LED_updater);
 						}
 						else
 						{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != redMask)
 								{
-									if (LoadChangeInMaintain == true)
-									{
-										printf("loadChangeinMaintain\t");
-										--dropCounter;
-										bitToChange = pow(2,dropCounter);
-										if ((bitToChange & offBits) == 0)
-										{
-											uiLoadBank += bitToChange;//Add loads
-											printf("\nAdd loads, uiLoadBank=%d,dropCounter=%d \n",uiLoadBank,dropCounter);
-										}else{
-											printf("bit already on\n");
-										}
-									}
-									else
-									{
-										printf("direct change\n");
-										--dropCounter;
-										bitToChange = pow(2,dropCounter);
-										uiLoadBank += bitToChange;//Add loads
-									}
+									uiLoadBank += change;//Add loads
+									printf("\nADD\n");
+									xSemaphoreGive(xSemaphore_LED_updater);
 								}
-	//							xSemaphoreGive(shareSource_LED_sem);
+								else
+								{
+									printf("all load present\n");
+									break;
+								}
 								uiManageTime = xTaskGetTickCount();
 							}
 						}
 						PreSysCon = sysCon;
-						xSemaphoreGive(xSemaphore_LED_updater);
 						break;
 					}
 
@@ -716,6 +724,7 @@ void initSharedResources()
 {
 	vSemaphoreCreateBinary(SharedSource_KB_update);
 	vSemaphoreCreateBinary(SharedSource_LCD_show);
+    vSemaphoreCreateBinary(SharedSource_loadbank);
     xSemaphore_Load_manager = xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
     xSemaphore_Freq_analyzer =xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
     xSemaphore_LED_updater =xSemaphoreCreateCounting(3,uxInitialCount);
