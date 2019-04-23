@@ -316,26 +316,34 @@ void updateThreshold(void *pvParameters)
 				case 0x45:  { numb = 0; break;}
 			}
 			temp[i_index]= numb;
-			++i_index;
+			++i_index;//length of input
 		}
-
-		for( int i=0,j=0; i<i_index;++i)
+		
+		/*Calculate for threshold*/
+		int thre = 0;
+		for (int i=0,j=i_index;i<i_index,j>0;++i,--j)
 		{
-			if(i%2 == 0)
-			{
-				result[j] = temp[i];
-				j_index = ++j;
-			}
+			thre += i * pow(10,j); //31 = 3*pow(10,1) + 1*pow(10,0)
 		}
-		//take every two element from array
-		int threshold = 0;
-		for( int  i = 0 , j = j_index ; i < j_index, j > 0; ++i , --j )
-		{
-			printf("result[%d]=%d ",i,result[i]);
-			threshold += result[i]*pow(10,j);
-		}
-//		printf("threshold=%f",(double)(threshold/10));
-		//prepare LCD for display threshold
+		printf("threshold=%f",(double)(thre/10));
+// 		for( int i=0,j=0; i<i_index;++i)
+// 		{
+// 			if(i%2 == 0)
+// 			{
+// 				result[j] = temp[i];
+// 				j_index = ++j;
+// 			}
+// 		}
+		/*take every two element from array*/
+// 			int threshold = 0;
+// 			for( int  i = 0 , j = j_index ; i < j_index, j > 0; ++i , --j )
+// 			{
+// 				printf("result[%d]=%d ",i,result[i]);
+// 				threshold += result[i]*pow(10,j);
+// 			}
+//			printf("threshold=%f",(double)(threshold/10));
+		
+		/*prepare LCD for display threshold*/
 		xSemaphoreTake(SharedSource_LCD_show,pdFALSE);
 		FILE* fp;
 		fp = fopen(CHARACTER_LCD_NAME, "w"); //open the character LCD as a file stream for write
