@@ -97,6 +97,7 @@ UBaseType_t uxInitialCount=0;
 double Threshold_Freq = 50;
 double Threshold_RoC = 5;
 bool Threshold_dec = false;
+
 /*Global Variables
  * Use to store the frequency history
  * Graphic use*/
@@ -105,7 +106,7 @@ SystemMode CurSysMode = RUN;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
-
+char keyboardRaiseEdge = false;
 /*Timer*/
 TimerHandle_t xTimer_LoadShed;
 //TimerHandle_t xTimer_
@@ -210,8 +211,16 @@ void ps2_isr (void* context, alt_u32 id)
 		case 0x46:
 		case 0x45:
 		{
-			xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
-			break;
+			if (keyboardRaiseEdge)
+			{
+				keyboardRaiseEdge = false;
+				xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
+				break;
+			}else{
+				keyboardRaiseEdge = true;
+				return;
+				break;
+			}
 		}
 	}
 	//1to0	16,1e,26,25,...etc
