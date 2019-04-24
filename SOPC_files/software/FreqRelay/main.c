@@ -113,7 +113,8 @@ typedef struct{
 SemaphoreHandle_t SharedSource_KB_update; 	 //use semaphore to control update procedure.
 SemaphoreHandle_t SharedSource_LCD_show; 	 //use to guard LCD usage.
 SemaphoreHandle_t SharedSource_Load_manager; // use with load manager
-SemaphoreHandle_t SharedSource_Thresholds; 	 // Used to pass thresholds to VGA
+SemaphoreHandle_t ShareSource_LED_sem;
+SemaphoreHandle_t xSem_FreqAnalyzer;
 UBaseType_t uxInitialCount=0;
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -139,7 +140,10 @@ char setFreqOrRoc = 'N';
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
-unsigned int uiDropLoadTime = 0; //stores the time cost of load dropping. in sec.
+//stores the time cost of load dropping. in sec.
+unsigned int uiTimer_LoadDropped = 0, uiTimer_isUnstable = 0, uiTimer_DropTime_reg = 0,
+		uiTimer_firstUnstable = 0,  uiTimer_firstLoadDropped = 0,uiTimer_DropTime_first=0,
+		uiTimer_DropTimer_History[5] = {0}, uiTimer_DropTimer_index=0;
 unsigned int dropCounter = 0;
 
 /*PreSysCon,
@@ -258,7 +262,6 @@ void ps2_isr (void* context, alt_u32 id)
 
 	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	if (byte == 0x5a){
-		//TODO: notify the updateThreshold task to run.
 		fclose(lcd);
 		return;
 	}
@@ -291,6 +294,10 @@ void ps2_isr (void* context, alt_u32 id)
 
 void PRVGADraw_Task(void *pvParameters ){
 
+	char s[20];
+	char t[20];
+	char u[30];
+	char loadHis[40];
 	//initialize VGA controllers
 	alt_up_pixel_buffer_dma_dev *pixel_buf;
 	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
@@ -327,27 +334,17 @@ void PRVGADraw_Task(void *pvParameters ){
 	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
 	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
 
-	char s[20];
-	char t[20];
-	char u[20];
-	sprintf(s, "Freq Thresh: %.2f", Threshold_Freq);
-	sprintf(t, "ROC Thresh: %.2f", Threshold_RoC);
-	sprintf(u, "Load drop time: %.2i", uiDropLoadTime);
 
-	alt_up_char_buffer_string(char_buf, s, 10, 46);
-	alt_up_char_buffer_string(char_buf, t, 10, 48);
-	alt_up_char_buffer_string(char_buf, u, 10, 50);
+
+
 
 
 	double freq[100], dfreq[100];
 	int i = 99, j = 0;
 	Line line_freq, line_roc;
 
-	while(1){
 
-		sprintf(s, "Freq Thresh: %.2f", Threshold_Freq);
-		sprintf(t, "ROC Thresh: %.2f", Threshold_RoC);
-		sprintf(u, "Load drop time: %.2i", uiDropLoadTime);
+	while(1){
 		//receive frequency data from queue
 		while(uxQueueMessagesWaiting( Q_freq_data ) != 0){
 			xQueueReceive( Q_freq_data, freq+i, 0 );
@@ -394,8 +391,22 @@ void PRVGADraw_Task(void *pvParameters ){
 				//Draw
 				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
 				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+
 			}
 		}
+
+		sprintf(s, "Freq Thresh: %.2f", Threshold_Freq);
+		sprintf(t, "ROC Thresh: %.2f", Threshold_RoC);
+		sprintf(u, "First Drop in(ms):%.2i", uiTimer_DropTime_first);
+		sprintf(loadHis, "Drop History(ms):%.2i %.2i %.2i %.2i %.2i",
+				uiTimer_DropTimer_History[0],uiTimer_DropTimer_History[1],
+				uiTimer_DropTimer_History[2],uiTimer_DropTimer_History[3],
+				uiTimer_DropTimer_History[4]);
+		alt_up_char_buffer_string(char_buf, s, 2, 46);
+		alt_up_char_buffer_string(char_buf, t, 2, 48);
+		alt_up_char_buffer_string(char_buf, u, 2, 50);
+		alt_up_char_buffer_string(char_buf, loadHis, 2, 55);
+
 		vTaskDelay(10);
 
 	}
@@ -407,7 +418,8 @@ void PRVGADraw_Task(void *pvParameters ){
  */
 void freq_relay(void *pvParameters)
 {
-#define SAMPLING_FREQ 16000.0
+	printf("\nfreq_relay\n");
+	#define SAMPLING_FREQ 16000.0
 	double temp = SAMPLING_FREQ/(double)IORD(FREQUENCY_ANALYSER_BASE, 0);
 
 	xQueueSendToBackFromISR( Q_freq_data, &temp, pdFALSE );
@@ -415,7 +427,7 @@ void freq_relay(void *pvParameters)
 
 	FreqInfo freqData = {
 			(double)16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0),
-			xTaskGetTickCountFromISR()/1000
+			xTaskGetTickCountFromISR()
 	};
 //	printf("freeq_value = %f\t time=%d\n",freqData.freq_value, freqData.record_time);
 
@@ -423,9 +435,11 @@ void freq_relay(void *pvParameters)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
-        xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
+
+//        xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
+        xSemaphoreGiveFromISR(xSem_FreqAnalyzer,FreqAnalyser_Task_P);
 	}
-	usleep(5000);
+//	usleep(5000);
 	return;
 }
 
@@ -439,8 +453,8 @@ void updateThreshold(void *pvParameters)
 	int updateCounter = 0;
 	while(1)
 	{
-		printf("\nUpdateThreshold\t");
 		xSemaphoreTake(SharedSource_KB_update, portMAX_DELAY);
+		printf("\nUpdateThreshold\t");
 		char key_q = 0;
 		unsigned int temp[10]={0},result[5]={0};
 		int inputLength = 0, resultLength = 0;
@@ -541,9 +555,9 @@ void updateThreshold(void *pvParameters)
  */
 void freq_analyser(void *pvParameters)
 {
-	printf("freq_analyser\n");
 	double RoC = 0;
 	int FreqHyIndex = 0;
+	bool isFirstUnstable = true;
 
 	/* read from queue
 	 * First check the current reading, if it's lower than threshold, call load ctr
@@ -551,6 +565,8 @@ void freq_analyser(void *pvParameters)
 	 */
 	while (1)
 	{
+		xSemaphoreTake(xSem_FreqAnalyzer,portMAX_DELAY);
+		printf("freq_analyser\n");
 		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
 		{
 //			printf("Readout from Q_FreqInfo\n \tFreq value:%f Time: %d\n",curFreq.freq_value, curFreq.record_time );
@@ -569,6 +585,13 @@ void freq_analyser(void *pvParameters)
 		if(curFreq.freq_value < Threshold_Freq || RoC > Threshold_RoC)
 		{
 			currentSysStability = UNSTABLE;//UNSTABLE;
+			if(isFirstUnstable)
+			{
+				uiTimer_firstUnstable = xTaskGetTickCount();
+				isFirstUnstable = false;
+			}else{
+				uiTimer_isUnstable = xTaskGetTickCount();
+			}
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
 		}else{
@@ -576,6 +599,8 @@ void freq_analyser(void *pvParameters)
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
 		}
+//		xSemaphoreGive(xSem_FreqAnalyzer);
+		xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
 		vTaskDelay(10);
 	}
 	return;
@@ -593,7 +618,8 @@ void load_manager(void *pvParameters)
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
-        xSemaphoreTake(SharedSource_Load_manager,portMax_DELAY);
+        xSemaphoreTake(SharedSource_Load_manager,portMAX_DELAY);
+        printf("\nLoadManager\n");
 		if(CurSysMode == RUN)
 		{
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
@@ -608,28 +634,24 @@ void load_manager(void *pvParameters)
 							if (uiLoadBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 							{
 								/*Drop very first load, the load is not dropped until update_led process it */
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
+								xSemaphoreTake(ShareSource_LED_sem,portMax_DELAY);
 								uiLoadBank -= (unsigned int)pow(2,dropCounter);
-								if (isFirstLoadDrop){
-									uiDropLoadTime = xTaskGetTickCount();
-									isFirstLoadDrop = false;
-								}
+								xSemaphoreGive(ShareSource_LED_sem);
 								++dropCounter;
 	//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
-	//							xSemaphoreGive(shareSource_LED_sem);
 							}
 							uiManageTime = xTaskGetTickCount();
 						}else{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
 								/*Drop loads after first load is dropped, 500ms waiting applies*/
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
+								xSemaphoreTake(ShareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != 0){
 									uiLoadBank -= pow(2,dropCounter);
 									++dropCounter;
 	//								printf("\n##UNSTABLE-->dropLoad, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
-	//							xSemaphoreGive(shareSource_LED_sem);
+								xSemaphoreGive(ShareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
 							}
 
@@ -646,14 +668,14 @@ void load_manager(void *pvParameters)
 						}else{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
-	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
+								xSemaphoreTake(ShareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != redMask)
 								{
 									--dropCounter;
 									uiLoadBank += pow(2,dropCounter);//Add loads
 //									printf("\n##STABLE-->Add loads, uiLoadBank=%d,dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
-	//							xSemaphoreGive(shareSource_LED_sem);
+								xSemaphoreGive(ShareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
 							}
 						}
@@ -679,7 +701,6 @@ void load_manager(void *pvParameters)
 void update_LED(void *pvParameters)
 {
 	bool isFirstUpdate = true;
-	printf("update LED\n");
 	unsigned int uiSwitchValue;
 	unsigned int uiRedLED;
 	unsigned int uiGreenLED;
@@ -687,7 +708,8 @@ void update_LED(void *pvParameters)
 	while(1)
 	{
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
-//			xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
+			xSemaphoreTake(ShareSource_LED_sem,portMAX_DELAY);
+			printf("update LED\n");
 			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
 			uiRedLED = uiSwitchValue & uiLoadBank;
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
@@ -699,7 +721,12 @@ void update_LED(void *pvParameters)
 		}else{
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
 			if (isFirstUpdate){
-				uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime)/1000;
+				uiTimer_firstLoadDropped = xTaskGetTickCount()- uiTimer_firstUnstable;
+				isFirstUpdate = false;
+			}else{
+				uiTimer_DropTime_reg = xTaskGetTickCount() - uiTimer_isUnstable;
+				uiTimer_DropTimer_History[uiTimer_DropTimer_index%5]=uiTimer_DropTime_reg;
+				++uiTimer_DropTimer_index;
 			}
 			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 		}
@@ -786,9 +813,11 @@ static void initKeyBDISR()
 
 void initSharedResources()
 {
+	vSemaphoreCreateBinary(xSem_FreqAnalyzer);
 	vSemaphoreCreateBinary(SharedSource_KB_update);
 	vSemaphoreCreateBinary(SharedSource_LCD_show);
     vSemaphoreCreateBinary(SharedSource_Load_manager);
+    vSemaphoreCreateBinary(ShareSource_LED_sem);
 	return;
 }
 void initTask()
