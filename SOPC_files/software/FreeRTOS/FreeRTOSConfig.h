@@ -121,7 +121,7 @@ to exclude the API function. */
 #define INCLUDE_uxTaskPriorityGet			0
 #define INCLUDE_vTaskDelete					1
 #define INCLUDE_vTaskCleanUpResources		1
-#define INCLUDE_vTaskSuspend				0
+#define INCLUDE_vTaskSuspend				1
 #define INCLUDE_vTaskDelayUntil				0
 #define INCLUDE_vTaskDelay					1
 #define INCLUDE_uxTaskGetStackHighWaterMark	1
@@ -134,5 +134,6 @@ kept at 1. */
 be called.  Only API functions that end in ...FromISR() can be used within
 interrupts. */
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY	0x03
-
+#define portMax_DELAY							0xC8
+//#define portMax_DELAY_KB						0
 #endif /* FREERTOS_CONFIG_H */
