@@ -298,6 +298,7 @@ void PRVGADraw_Task(void *pvParameters ){
 	char t[20];
 	char u[30];
 	char loadHis[40];
+	char stable[10];
 	//initialize VGA controllers
 	alt_up_pixel_buffer_dma_dev *pixel_buf;
 	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
@@ -402,10 +403,12 @@ void PRVGADraw_Task(void *pvParameters ){
 				uiTimer_DropTimer_History[0],uiTimer_DropTimer_History[1],
 				uiTimer_DropTimer_History[2],uiTimer_DropTimer_History[3],
 				uiTimer_DropTimer_History[4]);
+		sprintf(stable, "SystemStatus:%s",(PreSysCon==STABLE)?"STABLE":"UNSTABLE");
 		alt_up_char_buffer_string(char_buf, s, 2, 46);
 		alt_up_char_buffer_string(char_buf, t, 2, 48);
 		alt_up_char_buffer_string(char_buf, u, 2, 50);
 		alt_up_char_buffer_string(char_buf, loadHis, 2, 55);
+        alt_up_char_buffer_string(char_buf, stable, 2, 57);
 
 		vTaskDelay(10);
 
