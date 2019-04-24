@@ -27,14 +27,30 @@
 #include "alt_types.h"                 	// alt_u32 is a kind of alt_types
 #include "sys/alt_irq.h"              	// to register interrupts
 
+//For frequency plot
+#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
+#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
+#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
+#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+
+#define ROCPLT_ORI_X 101
+#define ROCPLT_GRID_SIZE_X 5
+#define ROCPLT_ORI_Y 259.0
+#define ROCPLT_ROC_RES 0.5		//number of pixels per Hz/s (y axis scale)
+
+#define MIN_FREQ 45.0 //minimum frequency to draw
+
+
+
 /*Task Priorities:*/
 // #define Counter_Task_P      	(tskIDLE_PRIORITY)
 #define FreqAnalyser_Task_P		(tskIDLE_PRIORITY+5)
+#define LoadManager_Task_P 		(tskIDLE_PRIORITY+5)
 #define UpdateLED_Task_P 		(tskIDLE_PRIORITY+5)
-#define LoadManager_Task_P 		(tskIDLE_PRIORITY+4)
 #define UpdateThresholds_P		(tskIDLE_PRIORITY+5)
+#define PRVGADraw_Task_P      	(tskIDLE_PRIORITY+4)
 #define UpdateScreen_P			(tskIDLE_PRIORITY+4)
-#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+1)
+//#define SystemChecker_Task_P 	(tskIDLE_PRIORITY+1)
 
 
 /*Functions*/
@@ -53,6 +69,7 @@ TaskHandle_t xHandle_thresholdUpdate;
 TaskHandle_t xHandle_loadManager;
 TaskHandle_t xHandle_freqAnalazer;
 TaskHandle_t xHandle_systemCheck;
+TaskHandle_t PRVGADraw;
 
 /*Enum and Constants*/
 #define MaxRecordNum  5
@@ -85,13 +102,18 @@ typedef struct FreqInfo{
 FreqInfo preFreq,curFreq;
 FreqInfo historyFreq[MaxRecordNum];
 
+typedef struct{
+	unsigned int x1;
+	unsigned int y1;
+	unsigned int x2;
+	unsigned int y2;
+}Line;
+
 /*Semaphore*/
-SemaphoreHandle_t SharedSource_KB_update; //use semaphore to control update procedure.
-SemaphoreHandle_t SharedSource_LCD_show; //use to gard lcd usage.
-SemaphoreHandle_t xSemaphore_Freq_analyzer;
-SemaphoreHandle_t xSemaphore_Load_manager; // use with load manager
-SemaphoreHandle_t xSemaphore_LED_updater;
-UBaseType_t uxMaxCount_sem=50;
+SemaphoreHandle_t SharedSource_KB_update; 	 //use semaphore to control update procedure.
+SemaphoreHandle_t SharedSource_LCD_show; 	 //use to guard LCD usage.
+SemaphoreHandle_t SharedSource_Load_manager; // use with load manager
+SemaphoreHandle_t SharedSource_Thresholds; 	 // Used to pass thresholds to VGA
 UBaseType_t uxInitialCount=0;
 /*Threshold*/
 double Threshold_Freq = 50;
@@ -106,10 +128,8 @@ SystemMode CurSysMode = RUN;
 char keyInputbuffer[10] ;
 int keyInputIndex = 1;
 int keyInputSum = 0;
-char keyboardRaiseEdge = false;
-/*Timer*/
-TimerHandle_t xTimer_LoadShed;
-//TimerHandle_t xTimer_
+bool KeyboardRaiseEdge = false;
+
 /*For Threshold setting,
  * setFreqOrRoc = r/R for setting RoC threshold
  * setFreqOrRoc = f/F for setting Frequency threshold
@@ -119,8 +139,7 @@ char setFreqOrRoc = 'N';
 /*Record of current ON loads, in terms of LEDs*/
 unsigned int uiLoadBank = 0;
 unsigned int uiManageTime = 0;
-TickType_t xTimer1 ; //stores the time cost of load dropping..
-TickType_t xTimer2;
+unsigned int uiDropLoadTime = 0; //stores the time cost of load dropping. in sec.
 unsigned int dropCounter = 0;
 
 /*PreSysCon,
@@ -139,7 +158,7 @@ static QueueHandle_t Q_KeyboardInput;
 static QueueHandle_t Q_LoadOperation;
 static QueueHandle_t Q_VGAUpdateValues;
 static QueueHandle_t Q_VGAUpdateTime;
-
+static QueueHandle_t Q_freq_data;
 
 /*-------------Interrupts--------------------*/
 /* PushBtn ISR,
@@ -147,8 +166,8 @@ static QueueHandle_t Q_VGAUpdateTime;
  */
 void pushbutton_ISR(void* context, alt_u32 id)
 {
-//	printf("\n button interrupt triggers\n alt_u32 id = %d\n", id);
-	// need to cast the context first before using it
+	//printf("\n button interrupt triggers\n alt_u32 id = %d\n", id);
+	//need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
 	xSemaphoreTakeFromISR(SharedSource_LCD_show,pdFALSE);
@@ -174,7 +193,7 @@ void pushbutton_ISR(void* context, alt_u32 id)
 		  fprintf(lcd, "%c%s %s",esc,"[2J","Maintenance\nEnter r or f\n");
 		  fclose(lcd);
 		  alt_irq_enable(PS2_IRQ);
-		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
+//		  xSemaphoreGiveFromISR(SharedSource_KB_update,UpdateThresholds_P);
 		  printf("SEM given in pushbtn fn\n");
 		  xSemaphoreGiveFromISR(SharedSource_LCD_show,pdFALSE);
 		  break;
@@ -194,11 +213,17 @@ void ps2_isr (void* context, alt_u32 id)
 {
 	printf("\nps2_isr:\t");
 	unsigned char byte, temp;
+
+	bool isEnterHit = false;
 	temp = byte;
 	alt_up_ps2_dev * ps2_device = alt_up_ps2_open_dev(PS2_NAME);
 	alt_up_ps2_read_data_byte_timeout(ps2_device, &byte);
 	printf("Scan code: %x\n", byte);
-	//filte out invalid values
+	//filter out invalid values
+	//1to0	16,1e,26,25,...etc
+	//R = 0x2d
+	//F = 0x2b
+	//Enter = 0x5a
 	switch (byte){
 		case 0x16:
 		case 0x1e:
@@ -211,22 +236,26 @@ void ps2_isr (void* context, alt_u32 id)
 		case 0x46:
 		case 0x45:
 		{
-			if (keyboardRaiseEdge)
-			{
-				keyboardRaiseEdge = false;
 				xQueueSendToBackFromISR(Q_KeyboardInput, &byte,pdFALSE);
+				isEnterHit = false;
 				break;
+		}
+		case 0x5a:
+		{
+			if (KeyboardRaiseEdge){
+				xSemaphoreGiveFromISR(SharedSource_LCD_show,portMax_DELAY);
+				xSemaphoreGiveFromISR(SharedSource_KB_update,portMax_DELAY);
+				isEnterHit = true;
+				KeyboardRaiseEdge = false;
+				printf("KEYBOARD:ENTER_RAISE\n");
 			}else{
-				keyboardRaiseEdge = true;
-				return;
-				break;
+				KeyboardRaiseEdge = true;
+				printf("KEYBOARD:ENTER_DOWN\n");
 			}
+			break;
 		}
 	}
-	//1to0	16,1e,26,25,...etc
-	//R = 0x2d
-	//F = 0x2b
-	//Enter = 0x5a
+
 	FILE* lcd = fopen(CHARACTER_LCD_NAME, "w");
 	if (byte == 0x5a){
 		//TODO: notify the updateThreshold task to run.
@@ -250,11 +279,127 @@ void ps2_isr (void* context, alt_u32 id)
 		Threshold_dec = true;
 		fclose(lcd);
 		return;
+	}else if (isEnterHit){
+		fprintf(lcd,"%c%s %s",esc,"[2J","Confirmed \n");
+		fclose(lcd);
+
 	}
 	return;
 }
 
+/****** VGA display ******/
 
+void PRVGADraw_Task(void *pvParameters ){
+
+	//initialize VGA controllers
+	alt_up_pixel_buffer_dma_dev *pixel_buf;
+	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+	if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
+	alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+	alt_up_char_buffer_dev *char_buf;
+	char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
+	alt_up_char_buffer_clear(char_buf);
+
+
+
+	//Set up plot axes
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+	alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+	alt_up_char_buffer_string(char_buf, "52", 10, 7);
+	alt_up_char_buffer_string(char_buf, "50", 10, 12);
+	alt_up_char_buffer_string(char_buf, "48", 10, 17);
+	alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+	alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+	alt_up_char_buffer_string(char_buf, "60", 10, 28);
+	alt_up_char_buffer_string(char_buf, "30", 10, 30);
+	alt_up_char_buffer_string(char_buf, "0", 10, 32);
+	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+	char s[20];
+	char t[20];
+	char u[20];
+	sprintf(s, "Freq Thresh: %.2f", Threshold_Freq);
+	sprintf(t, "ROC Thresh: %.2f", Threshold_RoC);
+	sprintf(u, "Load drop time: %.2i", uiDropLoadTime);
+
+	alt_up_char_buffer_string(char_buf, s, 10, 46);
+	alt_up_char_buffer_string(char_buf, t, 10, 48);
+	alt_up_char_buffer_string(char_buf, u, 10, 50);
+
+
+	double freq[100], dfreq[100];
+	int i = 99, j = 0;
+	Line line_freq, line_roc;
+
+	while(1){
+
+		sprintf(s, "Freq Thresh: %.2f", Threshold_Freq);
+		sprintf(t, "ROC Thresh: %.2f", Threshold_RoC);
+		sprintf(u, "Load drop time: %.2i", uiDropLoadTime);
+		//receive frequency data from queue
+		while(uxQueueMessagesWaiting( Q_freq_data ) != 0){
+			xQueueReceive( Q_freq_data, freq+i, 0 );
+
+			//calculate frequency RoC
+
+			if(i==0){
+				dfreq[0] = (freq[0]-freq[99]) * 2.0 * freq[0] * freq[99] / (freq[0]+freq[99]);
+			}
+			else{
+				dfreq[i] = (freq[i]-freq[i-1]) * 2.0 * freq[i]* freq[i-1] / (freq[i]+freq[i-1]);
+			}
+
+			if (dfreq[i] > 100.0){
+				dfreq[i] = 100.0;
+			}
+
+
+			i =	++i%100; //point to the next data (oldest) to be overwritten
+
+		}
+
+		//clear old graph to draw new graph
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+		for(j=0;j<99;++j){ //i here points to the oldest data, j loops through all the data to be drawn on VGA
+			if (((int)(freq[(i+j)%100]) > MIN_FREQ) && ((int)(freq[(i+j+1)%100]) > MIN_FREQ)){
+				//Calculate coordinates of the two data points to draw a line in between
+				//Frequency plot
+				line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * j;
+				line_freq.y1 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j)%100] - MIN_FREQ));
+
+				line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * (j + 1);
+				line_freq.y2 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j+1)%100] - MIN_FREQ));
+
+				//Frequency RoC plot
+				line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * j;
+				line_roc.y1 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j)%100]);
+
+				line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * (j + 1);
+				line_roc.y2 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j+1)%100]);
+
+				//Draw
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+			}
+		}
+		vTaskDelay(10);
+
+	}
+}
 
 /* Frequency relay ISR
  * Record frequency value and time on interrupt
@@ -262,6 +407,12 @@ void ps2_isr (void* context, alt_u32 id)
  */
 void freq_relay(void *pvParameters)
 {
+#define SAMPLING_FREQ 16000.0
+	double temp = SAMPLING_FREQ/(double)IORD(FREQUENCY_ANALYSER_BASE, 0);
+
+	xQueueSendToBackFromISR( Q_freq_data, &temp, pdFALSE );
+
+
 	FreqInfo freqData = {
 			(double)16000/(double)IORD(FREQUENCY_ANALYSER_BASE, 0),
 			xTaskGetTickCountFromISR()/1000
@@ -272,14 +423,9 @@ void freq_relay(void *pvParameters)
 	{
 		xQueueSendToBackFromISR( Q_FreqInfo, &freqData, pdFALSE );
 		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
-        xSemaphoreGiveFromISR(xSemaphore_Freq_analyzer,FreqAnalyser_Task_P);
-	}else if(CurSysMode == MAINTAIN)
-	{
-		/* In maintain mode, the frequency info is only send to queue for VGA display*/
-		//TODO: send freq and time for plot
-		xQueueSendToBackFromISR( Q_VGAUpdateValues, &freqData.record_time, pdFALSE );
+        xSemaphoreGiveFromISR(SharedSource_Load_manager,LoadManager_Task_P);
 	}
-//	usleep(5000);
+	usleep(5000);
 	return;
 }
 
@@ -294,10 +440,12 @@ void updateThreshold(void *pvParameters)
 	while(1)
 	{
 		printf("\nUpdateThreshold\t");
-		xSemaphoreTake(SharedSource_KB_update, portMax_DELAY);
+		xSemaphoreTake(SharedSource_KB_update, portMAX_DELAY);
 		char key_q = 0;
-		int i_index = 0, j_index = 0;
-		char temp[10], result[5];
+		unsigned int temp[10]={0},result[5]={0};
+		int inputLength = 0, resultLength = 0;
+		bool isEnterHit = false;
+		double threshold = 0;
 		while(uxQueueMessagesWaiting(Q_KeyboardInput) != pdFALSE)
 		{
 			xQueueReceive(Q_KeyboardInput,&key_q,portMax_DELAY);
@@ -314,65 +462,72 @@ void updateThreshold(void *pvParameters)
 				case 0x3e:  { numb = 8; break;}
 				case 0x46:  { numb = 9; break;}
 				case 0x45:  { numb = 0; break;}
+//				case 0x5a:	{isEnterHit = true;break;}
 			}
-			temp[i_index]= numb;
-			++i_index;//length of input
-		}
-		
-		/*Calculate for threshold*/
-		int thre = 0;
-		for (int i=0,j=i_index;i<i_index,j>0;++i,--j)
-		{
-			thre += i * pow(10,j); //31 = 3*pow(10,1) + 1*pow(10,0)
-		}
-		printf("threshold=%f",(double)(thre/10));
-// 		for( int i=0,j=0; i<i_index;++i)
-// 		{
-// 			if(i%2 == 0)
-// 			{
-// 				result[j] = temp[i];
-// 				j_index = ++j;
-// 			}
-// 		}
-		/*take every two element from array*/
-// 			int threshold = 0;
-// 			for( int  i = 0 , j = j_index ; i < j_index, j > 0; ++i , --j )
-// 			{
-// 				printf("result[%d]=%d ",i,result[i]);
-// 				threshold += result[i]*pow(10,j);
-// 			}
-//			printf("threshold=%f",(double)(threshold/10));
-		
-		/*prepare LCD for display threshold*/
-		xSemaphoreTake(SharedSource_LCD_show,pdFALSE);
-		FILE* fp;
-		fp = fopen(CHARACTER_LCD_NAME, "w"); //open the character LCD as a file stream for write
+			temp[inputLength]= numb;
+			printf("temp[%d]=%d ",inputLength,temp[inputLength]);
+			++inputLength;
 
-		if (fp == NULL) {
-			printf("open failed\n");
+			for( int i=0,j=0; i<=inputLength;++i)//take every two element from array
+			{
+				if(i%2 == 0)
+				{
+					result[j] = temp[i];
+					resultLength = ++j;
+				}
+			}
+			printf("\nRESULT:");
+			for (int index = 0; index<=resultLength; ++index)
+			{
+				printf("result[%d]=%d ",index,result[index]);
+			}
+			printf("\n");
+
 		}
-		if (setFreqOrRoc == 'r')
+		/*calculate thread*/
+		for( int  i=0 , j=resultLength ; i<resultLength, j>0; ++i , --j )
 		{
-			Threshold_RoC = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/10.0) ;
-			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
-			printf("ROC=%f",Threshold_RoC);
+			threshold += result[i]*pow(10,j);
 		}
-		else if(setFreqOrRoc == 'f')
-		{
-			Threshold_Freq = (Threshold_dec)? (double)(threshold/100.0) : (double)(threshold/10.0) ;
-			fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
-			printf("Freq=%f",Threshold_Freq);
-		}
-		else
-		{
-			printf("\n##ENTER r for ROC, f for Frequency\n");
-		}
-		setFreqOrRoc = 'N';
-		fclose(fp);
-		xSemaphoreGive(SharedSource_LCD_show);
-		++updateCounter;
-		Threshold_dec = false;
-//		printf("updateCounter = %d\n",updateCounter);
+
+		//prepare LCD for display threshold
+//		if(KeyboardRaiseEdge)
+//		{
+			xSemaphoreTake(SharedSource_LCD_show,pdFALSE);
+			FILE* fp;
+			fp = fopen(CHARACTER_LCD_NAME, "w"); //open the character LCD as a file stream for write
+
+			if (fp == NULL) {
+				printf("open failed\n");
+			}
+			if (setFreqOrRoc == 'r')
+			{
+				Threshold_RoC = (Threshold_dec)? (double)(threshold/1000.0) : (double)(threshold/100.0) ;
+				printf("\nCalculated Threshold=%f",threshold);
+				fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
+				xSemaphoreGive(SharedSource_LCD_show);
+				printf("ROC=%f",Threshold_RoC);
+			}
+			else if(setFreqOrRoc == 'f')
+			{
+				Threshold_Freq = (Threshold_dec)? (double)(threshold/1000.0) : (double)(threshold/100.0) ;
+				printf("\nCalculated Threshold=%f",threshold);
+				fprintf(fp, "%c%s RoC:%.1f\n Freq:%.1f\n", esc,"[2J",Threshold_RoC,Threshold_Freq);
+				xSemaphoreGive(SharedSource_LCD_show);
+				printf("Freq=%f",Threshold_Freq);
+			}
+			else
+			{
+				printf("\n##ENTER r for ROC, f for Frequency\n");
+			}
+			setFreqOrRoc = 'N';
+			fclose(fp);
+			++updateCounter;
+			Threshold_dec = false;
+			//		printf("updateCounter = %d\n",updateCounter);
+//			isEnterHit = false;
+//		}
+	vTaskDelay(10);
 	}
 //	vTaskDelay(5000);
 	return;
@@ -389,14 +544,13 @@ void freq_analyser(void *pvParameters)
 	printf("freq_analyser\n");
 	double RoC = 0;
 	int FreqHyIndex = 0;
-	bool isFirstLoadDrop = true;
+
 	/* read from queue
 	 * First check the current reading, if it's lower than threshold, call load ctr
 	 * If the available data is more than 2, calculate RoC
 	 */
 	while (1)
 	{
-		xSemaphoreTake(xSemaphore_Freq_analyzer,portMax_DELAY);
 		if (xQueueReceive( Q_FreqInfo, &curFreq, portMax_DELAY) == pdTRUE)
 		{
 //			printf("Readout from Q_FreqInfo\n \tFreq value:%f Time: %d\n",curFreq.freq_value, curFreq.record_time );
@@ -417,18 +571,12 @@ void freq_analyser(void *pvParameters)
 			currentSysStability = UNSTABLE;//UNSTABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys UNSTABLE\n",RoC,curFreq.freq_value);
-//			if (isFirstLoadDrop && curFreq.record_time > 0){
-//				xTimer1 = xTaskGetTickCount();
-//				isFirstLoadDrop = false;
-//				printf("\nxTimer1 = %d\n",(int)xTimer1);
-//			}
-			xSemaphoreGive(xSemaphore_Load_manager);
 		}else{
 			currentSysStability = STABLE;//STABLE;
 			xQueueSendToBackFromISR(Q_LoadOperation,&currentSysStability, pdFALSE);
 //			printf("\tRoc:%f freq:%f \tSys STABLE\n",RoC,curFreq.freq_value);
-			xSemaphoreGive(xSemaphore_Load_manager);
 		}
+		vTaskDelay(10);
 	}
 	return;
 
@@ -441,10 +589,11 @@ void freq_analyser(void *pvParameters)
 void load_manager(void *pvParameters)
 {
 	bool isFirstLoadDrop = true;
+
 	SystemCondition sysCon = UNDEFINED_SysCon;
 	while(1)
 	{
-        xSemaphoreTake(xSemaphore_Load_manager,portMax_DELAY);
+        xSemaphoreTake(SharedSource_Load_manager,portMax_DELAY);
 		if(CurSysMode == RUN)
 		{
 			if (xQueueReceive(Q_LoadOperation,&sysCon,portMax_DELAY) == pdTRUE)
@@ -453,37 +602,43 @@ void load_manager(void *pvParameters)
 				switch(sysCon)
 				{
 					case UNSTABLE: {
+	//					printf("sysCon=UNSTABLE\n");
 						if (sysCon != PreSysCon)
 						{
 							if (uiLoadBank == redMask)//check if all loads are present - If so,shed the first load(lowest priority)
 							{
 								/*Drop very first load, the load is not dropped until update_led process it */
+	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								uiLoadBank -= (unsigned int)pow(2,dropCounter);
 								if (isFirstLoadDrop){
-									xTimer1 = xTaskGetTickCount();
+									uiDropLoadTime = xTaskGetTickCount();
 									isFirstLoadDrop = false;
 								}
 								++dropCounter;
 	//							printf("\n##UNSTABLE-->dropLoad_FIRST, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
-								xSemaphoreGive(xSemaphore_LED_updater);							}
+	//							xSemaphoreGive(shareSource_LED_sem);
+							}
 							uiManageTime = xTaskGetTickCount();
 						}else{
 							if ( xTaskGetTickCount() - 500 > uiManageTime )
 							{
 								/*Drop loads after first load is dropped, 500ms waiting applies*/
+	//							xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 								if (uiLoadBank != 0){
 									uiLoadBank -= pow(2,dropCounter);
 									++dropCounter;
 	//								printf("\n##UNSTABLE-->dropLoad, uiLoadBank=%d, dropCounter=%d ##\n",uiLoadBank,dropCounter);
 								}
+	//							xSemaphoreGive(shareSource_LED_sem);
 								uiManageTime = xTaskGetTickCount();
 							}
-							xSemaphoreGive(xSemaphore_LED_updater);
+
 						}
 						PreSysCon = sysCon;
 						break;
 					}
 					case STABLE: {
+	//					printf("sysCon=STABLE\n");
 						if (sysCon != PreSysCon)
 						{
 							/*Start put loads back on */
@@ -503,7 +658,6 @@ void load_manager(void *pvParameters)
 							}
 						}
 						PreSysCon = sysCon;
-						xSemaphoreGive(xSemaphore_LED_updater);
 						break;
 					}
 
@@ -514,6 +668,7 @@ void load_manager(void *pvParameters)
 				}
 			}
 		}
+		vTaskDelay(10);
 	}
 	return;
 }
@@ -531,76 +686,27 @@ void update_LED(void *pvParameters)
 	/*indicate load condition with LEDs*/
 	while(1)
 	{
-		xSemaphoreTake(xSemaphore_LED_updater,portMax_DELAY);
 		/*If the system is stable, switch can be used to control load on/off correspondingly*/
+//			xSemaphoreTake(shareSource_LED_sem,portMax_DELAY);
 			uiSwitchValue = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-		if( CurSysMode == RUN){
 			uiRedLED = uiSwitchValue & uiLoadBank;
 			uiGreenLED = (~uiRedLED & uiSwitchValue)&redMask ;
-			if(currentSysStability == 1)
-			{
-				//For Most 5 right
-				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
-			}else{
-				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-				if (isFirstUpdate && xTimer1 != 0){
-					xTimer2 = xTaskGetTickCount();
-					printf("First Load Drop Cost:%d ms\n",(int)(xTimer2 - xTimer1));
-					isFirstUpdate = false;
-				}
-				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
-			}
-		}else{
-			/*In Maintenance mode, Loads are controlled by switches no matter what in the uiLoadBank at the moment
-			 * Update the uiLoadBank after control*/
-			uiRedLED = uiSwitchValue & redMask;
-			unsigned int diff = uiLoadBank ^ uiSwitchValue;
+		if(currentSysStability == 1)
+		{
+			//For Most 5 right
 			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
-			uiLoadBank = uiRedLED & redMask;
-			int itr = 0;
-			for(itr = 0; diff != 0x1; diff = diff >> 1,++itr);
-			dropCounter = itr;
-			printf("\ndropCounter  = %d\n",dropCounter);
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
+		}else{
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, uiRedLED);
+			if (isFirstUpdate){
+				uiDropLoadTime = abs(xTaskGetTickCount()- uiDropLoadTime)/1000;
+			}
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, uiGreenLED);
 		}
+		vTaskDelay(10);
 	}
 			printf("update_LED,system unstable");
 			return;
-}
-
-/*System Check
- * Checking the system operation status and make correction
- * Manage updateThreshold operation
- */
-void system_checker(void *pvParameters)
-{
-	SystemMode prevMode;
-	while(1)
-	{
-		printf("\n System Checker\t");
-
-		if (CurSysMode != prevMode)
-		{
-			if (CurSysMode == RUN)
-			{
-				alt_irq_disable(PS2_IRQ);
-				printf("\n Disable ps2_irq\n");
-				vTaskSuspend(xHandle_thresholdUpdate);
-				printf("thresholdUpdate suspended\n");
-				prevMode = CurSysMode;
-			}
-			/*In Maintenance mode*/
-			else
-			{
-				initKeyBDISR();
-				vTaskResume(xHandle_thresholdUpdate);
-				printf("thresholdUpdate resumed\n");
-				prevMode = CurSysMode;
-			}
-		}
-//		vTaskSuspend(NULL);
-	}
-	return;
 }
 
 int main()
@@ -613,7 +719,6 @@ int main()
 	initTask();
 	printf("\tinitCreateTask\n");
 	initSharedResources();
-//	xSemaphoreTake(SharedSource_KB_update,portMax_DELAY);
 	printf("\tinitSharedResources\n");
 	vTaskStartScheduler();
 	while (1)
@@ -643,13 +748,14 @@ void initSystem()
 		Q_KeyboardInput = xQueueCreate(1000,sizeof(char));
 		Q_LoadOperation = xQueueCreate(1000,sizeof(int));
 		Q_VGAUpdateValues = xQueueCreate(1000,sizeof(unsigned char));//Change type
-		Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));//change type
+		Q_VGAUpdateTime = xQueueCreate(1000,sizeof(unsigned char));
+		Q_freq_data = xQueueCreate( 100, sizeof(double) );
 		return;
 }
 void initInterrupts(void)
 {
 	/*Frequency Analyzer ISR*/
-		alt_irq_register(FREQUENCY_ANALYSER_IRQ,(void*)0, freq_relay);
+		alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
 
 	/*Pushbutton interrupts,for maintenance mode*/
 		int buttonValue = 0;
@@ -682,21 +788,11 @@ void initSharedResources()
 {
 	vSemaphoreCreateBinary(SharedSource_KB_update);
 	vSemaphoreCreateBinary(SharedSource_LCD_show);
-    xSemaphore_Load_manager = xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
-    xSemaphore_Freq_analyzer =xSemaphoreCreateCounting(uxMaxCount_sem,uxInitialCount);
-    xSemaphore_LED_updater =xSemaphoreCreateCounting(3,uxInitialCount);
-//    xTimer_LoadShed = xTimerCreate("ManagerTimer",1000,pdFALSE,0,tmr_dropLoad);
+    vSemaphoreCreateBinary(SharedSource_Load_manager);
 	return;
 }
 void initTask()
 {
-//	xTaskCreate(
-//			system_checker,
-//			"systemChecker_TASK",
-//			configMINIMAL_STACK_SIZE,
-//			NULL,
-//			SystemChecker_Task_P,
-//			&xHandle_systemCheck );
 
 	xTaskCreate(
 			load_manager,
@@ -730,6 +826,14 @@ void initTask()
 			UpdateThresholds_P,
 			&xHandle_thresholdUpdate );
 	//UpdateScreen_P
+
+	xTaskCreate(
+			PRVGADraw_Task,
+			"DrawTsk",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			PRVGADraw_Task_P,
+			&PRVGADraw );
 	return;
 
 }
